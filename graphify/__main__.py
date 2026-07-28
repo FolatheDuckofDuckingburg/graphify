@@ -739,6 +739,11 @@ def install(platform: str = "claude", *, project: bool = False, project_dir: Pat
     if platform == "cursor":
         _cursor_install(Path("."))
         return
+    if platform == "windsurf":
+        from graphify.platforms.windsurf import WindsurfIntegrator
+        integrator = WindsurfIntegrator(project_root=project_dir or ".")
+        integrator.install()
+        return
     # On Windows, antigravity needs the PowerShell skill, not the bash one
     if platform == "antigravity" and sys.platform == "win32":
         platform = "antigravity-windows"
@@ -817,7 +822,7 @@ def install(platform: str = "claude", *, project: bool = False, project_dir: Pat
 
 
 def _print_install_usage() -> None:
-    platforms = ", ".join([*_PLATFORM_CONFIG, "gemini", "cursor"])
+    platforms = ", ".join([*_PLATFORM_CONFIG, "gemini", "cursor", "windsurf"])
     print("Usage: graphify install [--project] [--platform P|P]")
     print(f"Platforms: {platforms}")
 
@@ -1779,6 +1784,11 @@ def _project_install(platform_name: str, project_dir: Path | None = None) -> Non
         skill_dst = _copy_skill_file("devin", project=True, project_dir=project_dir)
         _devin_rules_install(project_dir)
         _print_project_git_add_hint([_project_scope_root(skill_dst, project_dir), project_dir / ".windsurf"])
+    elif platform_name == "windsurf":
+        from graphify.platforms.windsurf import WindsurfIntegrator
+        integrator = WindsurfIntegrator(project_root=project_dir)
+        integrator.install()
+        _print_project_git_add_hint([project_dir / ".codeium"])
     elif platform_name == "antigravity":
         # Project-scoped: skill in .agents/skills/ PLUS the .agents/rules +
         # .agents/workflows always-on layer (previously this path wrote only the
@@ -1821,6 +1831,10 @@ def _project_uninstall(platform_name: str, project_dir: Path | None = None) -> N
         _devin_rules_uninstall(project_dir)
         if not removed:
             print("nothing to remove")
+    elif platform_name == "windsurf":
+        from graphify.platforms.windsurf import WindsurfIntegrator
+        integrator = WindsurfIntegrator(project_root=project_dir)
+        integrator.uninstall()
     elif platform_name in ("copilot", "pi", "kimi", "agents"):
         removed = _remove_skill_file(platform_name, project=True, project_dir=project_dir)
         if not removed:
@@ -2438,6 +2452,8 @@ def main() -> None:
         print("  pi uninstall            remove skill from ~/.pi/agent/skills/graphify/")
         print("  devin install           write skill to ~/.config/devin/skills/graphify/ (Devin CLI)")
         print("  devin uninstall         remove skill from ~/.config/devin/skills/graphify/")
+        print("  windsurf install        write configuration to .codeium/config.json (Windsurf IDE)")
+        print("  windsurf uninstall      remove configuration from .codeium/config.json")
         print()
         return
 
@@ -2631,6 +2647,25 @@ def main() -> None:
                 print("skill removed" if removed else "nothing to remove")
         else:
             print("Usage: graphify devin [install|uninstall]", file=sys.stderr)
+            sys.exit(1)
+    elif cmd == "windsurf":
+        subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
+        if subcmd == "install":
+            if "--project" in sys.argv[3:]:
+                _project_install("windsurf", Path("."))
+            else:
+                from graphify.platforms.windsurf import WindsurfIntegrator
+                integrator = WindsurfIntegrator()
+                integrator.install()
+        elif subcmd == "uninstall":
+            if "--project" in sys.argv[3:]:
+                _project_uninstall("windsurf", Path("."))
+            else:
+                from graphify.platforms.windsurf import WindsurfIntegrator
+                integrator = WindsurfIntegrator()
+                integrator.uninstall()
+        else:
+            print("Usage: graphify windsurf [install|uninstall]", file=sys.stderr)
             sys.exit(1)
     elif cmd == "pi":
         subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
