@@ -7,7 +7,6 @@ abstract class BaseClient
 
 class HttpClient(config: Config) extends BaseClient with Loggable {
   val source: Config = config
-  var fallback: BaseClient = null
 
   def get(path: String): String = {
     buildRequest("GET", path)

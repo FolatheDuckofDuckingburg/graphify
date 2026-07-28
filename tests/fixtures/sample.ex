@@ -4,7 +4,6 @@ defmodule MyApp.Accounts.User do
   """
 
   alias MyApp.Repo
-  alias MyApp.Schemas.{Account, Token}
   import Ecto.Query
 
   defstruct [:id, :name, :email]

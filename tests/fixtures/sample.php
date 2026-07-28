@@ -66,13 +66,6 @@ class DataProcessor extends BaseProcessor implements Loggable
     }
 }
 
-class Service
-{
-    public function __construct(private Result $result, string $label)
-    {
-    }
-}
-
 function parseResponse(string $raw): array
 {
     return json_decode($raw, true);

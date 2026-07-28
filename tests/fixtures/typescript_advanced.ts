@@ -57,10 +57,6 @@ export class UserService {
   bulkCreate(names: string[]): User[] {
     return names.map((n) => new User(n));
   }
-
-  getById(id: string): Promise<User | null> {
-    return this.repo.findById(id);
-  }
 }
 
 @Module({

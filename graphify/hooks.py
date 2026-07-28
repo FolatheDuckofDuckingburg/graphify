@@ -1,7 +1,6 @@
 # git hook integration - install/uninstall graphify post-commit and post-checkout hooks
 from __future__ import annotations
 import configparser
-import os
 import re
 import sys
 from pathlib import Path
@@ -21,18 +20,9 @@ _PYTHON_DETECT = """\
 # Detect the correct Python interpreter (handles uv tool, pipx, venv, system installs).
 # _PINNED was recorded at hook-install time; tried first so the hook works even
 # when the graphify launcher is not on PATH (common in GUI clients and CI).
-#
-# Probes check availability with importlib.util.find_spec instead of importing
-# the package: a probe that imports graphify wholesale executes the full package
-# import (10s+ cold on machines with AV-scanned or large site-packages) and used
-# to run up to FOUR times synchronously, stalling every commit before the
-# detached launch even started. find_spec locates the package without executing
-# it, so each probe costs interpreter startup only. The detached rebuild still
-# fails loudly in the log if the package is broken under that interpreter.
-_GFY_PROBE="import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('graphify') else 1)"
 GRAPHIFY_PYTHON=""
 _PINNED='__PINNED_PYTHON__'
-if [ -n "$_PINNED" ] && [ -x "$_PINNED" ] && "$_PINNED" -c "$_GFY_PROBE" 2>/dev/null; then
+if [ -n "$_PINNED" ] && [ -x "$_PINNED" ] && "$_PINNED" -c "import graphify" 2>/dev/null; then
     GRAPHIFY_PYTHON="$_PINNED"
 fi
 # Second probe: read graphify-out/.graphify_python (written by the skill and
@@ -44,34 +34,18 @@ if [ -z "$GRAPHIFY_PYTHON" ]; then
         case "$_FROM_FILE" in
             *[!a-zA-Z0-9/_.@:\\-]*) _FROM_FILE="" ;;  # allowlist (covers Windows paths)
         esac
-        if [ -n "$_FROM_FILE" ] && [ -x "$_FROM_FILE" ] && "$_FROM_FILE" -c "$_GFY_PROBE" 2>/dev/null; then
+        if [ -n "$_FROM_FILE" ] && [ -x "$_FROM_FILE" ] && "$_FROM_FILE" -c "import graphify" 2>/dev/null; then
             GRAPHIFY_PYTHON="$_FROM_FILE"
         fi
     fi
 fi
-# Third probe: resolve via the graphify launcher on PATH.
+# Third probe: resolve via the graphify launcher on PATH (shebang probe).
 if [ -z "$GRAPHIFY_PYTHON" ]; then
     GRAPHIFY_BIN=$(command -v graphify 2>/dev/null)
     if [ -n "$GRAPHIFY_BIN" ]; then
-        # Windows pip layout: Scripts/graphify(.exe) sits beside ..\\python.exe
-        # (or .\\python.exe inside a venv's Scripts dir). NOTE: command -v may
-        # return the launcher path WITHOUT the .exe suffix, so this cannot key
-        # on the extension.
-        _GFY_BINDIR=$(dirname "$GRAPHIFY_BIN")
-        if [ -x "$_GFY_BINDIR/../python.exe" ] && "$_GFY_BINDIR/../python.exe" -c "$_GFY_PROBE" 2>/dev/null; then
-            GRAPHIFY_PYTHON="$_GFY_BINDIR/../python.exe"
-        elif [ -x "$_GFY_BINDIR/python.exe" ] && "$_GFY_BINDIR/python.exe" -c "$_GFY_PROBE" 2>/dev/null; then
-            GRAPHIFY_PYTHON="$_GFY_BINDIR/python.exe"
-        fi
-    fi
-    if [ -z "$GRAPHIFY_PYTHON" ] && [ -n "$GRAPHIFY_BIN" ]; then
-        # POSIX launcher: parse the shebang. head -c + tr strip NUL bytes first —
-        # when the launcher is a Windows binary reached without its .exe suffix,
-        # a raw `head -1` reads binary into the command substitution and the
-        # shell warns about ignored null bytes on every commit.
         case "$GRAPHIFY_BIN" in
             *.exe) _SHEBANG="" ;;
-            *)     _SHEBANG=$(head -c 256 "$GRAPHIFY_BIN" 2>/dev/null | tr -d '\\000' | head -n 1 | sed 's/^#![[:space:]]*//') ;;
+            *)     _SHEBANG=$(head -1 "$GRAPHIFY_BIN" | sed 's/^#![[:space:]]*//') ;;
         esac
         case "$_SHEBANG" in
             */env\\ *) GRAPHIFY_PYTHON="${_SHEBANG#*/env }" ;;
@@ -82,16 +56,16 @@ if [ -z "$GRAPHIFY_PYTHON" ]; then
         case "$GRAPHIFY_PYTHON" in
             *[!a-zA-Z0-9/_.@-]*) GRAPHIFY_PYTHON="" ;;
         esac
-        if [ -n "$GRAPHIFY_PYTHON" ] && ! "$GRAPHIFY_PYTHON" -c "$_GFY_PROBE" 2>/dev/null; then
+        if [ -n "$GRAPHIFY_PYTHON" ] && ! "$GRAPHIFY_PYTHON" -c "import graphify" 2>/dev/null; then
             GRAPHIFY_PYTHON=""
         fi
     fi
 fi
 # Last resort: try python3 / python (works for system/venv installs on PATH).
 if [ -z "$GRAPHIFY_PYTHON" ]; then
-    if command -v python3 >/dev/null 2>&1 && python3 -c "$_GFY_PROBE" 2>/dev/null; then
+    if command -v python3 >/dev/null 2>&1 && python3 -c "import graphify" 2>/dev/null; then
         GRAPHIFY_PYTHON="python3"
-    elif command -v python >/dev/null 2>&1 && python -c "$_GFY_PROBE" 2>/dev/null; then
+    elif command -v python >/dev/null 2>&1 && python -c "import graphify" 2>/dev/null; then
         GRAPHIFY_PYTHON="python"
     else
         echo "[graphify hook] could not locate a Python with graphify installed. Add the graphify bin dir to PATH or re-run 'graphify hook install' from the env where graphify lives." >&2
@@ -99,146 +73,6 @@ if [ -z "$GRAPHIFY_PYTHON" ]; then
     fi
 fi
 """
-
-# The Python that the rebuild runs, shared by both hooks. Embedded verbatim into
-# the launcher below and re-executed in the detached child. Must not contain the
-# double-quote, $, backtick or backslash characters: it is carried inside a
-# shell double-quoted `-c "..."` argument (see _detached_launch).
-_REBUILD_BODY_COMMIT = """\
-import os, signal, sys
-from pathlib import Path
-
-changed_raw = os.environ.get('GRAPHIFY_CHANGED', '')
-changed = [Path(f.strip()) for f in changed_raw.strip().splitlines() if f.strip()]
-
-if not changed:
-    sys.exit(0)
-
-print(f'[graphify hook] {len(changed)} file(s) changed - rebuilding graph...')
-
-try:
-    from graphify.watch import _rebuild_code, _apply_resource_limits
-    _apply_resource_limits()
-    _timeout = int(os.environ.get('GRAPHIFY_REBUILD_TIMEOUT', '600'))
-    if _timeout > 0 and hasattr(signal, 'SIGALRM'):
-        signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError(f'graphify rebuild exceeded {_timeout}s')))
-        signal.alarm(_timeout)
-    _force = os.environ.get('GRAPHIFY_FORCE', '').lower() in ('1', 'true', 'yes')
-    _root = Path('.')
-    _out = os.environ.get('GRAPHIFY_OUT', 'graphify-out')
-    _saved = Path(_out) / '.graphify_root'
-    if _saved.exists():
-        _txt = _saved.read_text(encoding='utf-8').strip()
-        if _txt:
-            _root = Path(_txt)
-    _rebuild_code(_root, changed_paths=changed, force=_force)
-    # Refresh the work-memory lessons doc when saved Q&A outcomes exist
-    # (best-effort; never fails the hook).
-    try:
-        _md = (_root / _out) / 'memory'
-        if _md.is_dir() and any(_md.glob('*.md')):
-            from graphify.reflect import reflect as _reflect
-            _gj = (_root / _out) / 'graph.json'
-            _reflect(memory_dir=_md, out_path=(_root / _out) / 'reflections' / 'LESSONS.md',
-                     graph_path=_gj if _gj.exists() else None)
-    except Exception:
-        pass
-except TimeoutError as exc:
-    print(f'[graphify hook] {exc}')
-    sys.exit(1)
-except Exception as exc:
-    print(f'[graphify hook] Rebuild failed: {exc}')
-    sys.exit(1)
-"""
-
-_REBUILD_BODY_CHECKOUT = """\
-from graphify.watch import _rebuild_code, _apply_resource_limits
-from pathlib import Path
-import os, signal, sys
-try:
-    _apply_resource_limits()
-    _timeout = int(os.environ.get('GRAPHIFY_REBUILD_TIMEOUT', '600'))
-    if _timeout > 0 and hasattr(signal, 'SIGALRM'):
-        signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError(f'graphify rebuild exceeded {_timeout}s')))
-        signal.alarm(_timeout)
-    _force = os.environ.get('GRAPHIFY_FORCE', '').lower() in ('1', 'true', 'yes')
-    # post-checkout: branch switch can touch arbitrary files; full rebuild path
-    # (no changed_paths) is correct here. The flock inside _rebuild_code still
-    # prevents pile-ups when commit + checkout fire back-to-back.
-    _root = Path('.')
-    _out = os.environ.get('GRAPHIFY_OUT', 'graphify-out')
-    _saved = Path(_out) / '.graphify_root'
-    if _saved.exists():
-        _txt = _saved.read_text(encoding='utf-8').strip()
-        if _txt:
-            _root = Path(_txt)
-    _rebuild_code(_root, force=_force)
-    # Refresh the work-memory lessons doc when saved Q&A outcomes exist
-    # (best-effort; never fails the hook).
-    try:
-        _md = (_root / _out) / 'memory'
-        if _md.is_dir() and any(_md.glob('*.md')):
-            from graphify.reflect import reflect as _reflect
-            _gj = (_root / _out) / 'graph.json'
-            _reflect(memory_dir=_md, out_path=(_root / _out) / 'reflections' / 'LESSONS.md',
-                     graph_path=_gj if _gj.exists() else None)
-    except Exception:
-        pass
-except TimeoutError as exc:
-    print(f'[graphify] {exc}')
-    sys.exit(1)
-except Exception as exc:
-    print(f'[graphify] Rebuild failed: {exc}')
-    sys.exit(1)
-"""
-
-# Cross-platform detached-launch shim (#1161). The hooks used to background the
-# rebuild with `nohup "$GRAPHIFY_PYTHON" -c "..." &`, but Git for Windows' bundled
-# MSYS shell ships no nohup (nor setsid), so that line died with
-# 'nohup: command not found' and the rebuild silently never ran — git commit/pull
-# still returned 0, so the graph just went stale with no signal. graphify already
-# requires Python, so we let Python do the detaching: a tiny outer process spawns
-# the real rebuild fully detached and returns immediately, so the hook never
-# blocks. POSIX uses start_new_session (the setsid equivalent); Windows uses
-# DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, breaking away from any job object
-# when allowed. This payload is carried inside a shell double-quoted -c argument,
-# so it deliberately uses only single-quoted Python strings (no ", $, ` or \\).
-_LAUNCHER_TEMPLATE = """\
-import os, subprocess, sys
-_src = '''
-__REBUILD_BODY__
-'''
-_log = os.environ.get('GRAPHIFY_REBUILD_LOG') or os.path.join(os.path.expanduser('~'), '.cache', 'graphify-rebuild.log')
-try:
-    os.makedirs(os.path.dirname(_log), exist_ok=True)
-    _out = open(_log, 'a', buffering=1, encoding='utf-8', errors='replace')
-except OSError:
-    _out = subprocess.DEVNULL
-_kw = dict(stdout=_out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, cwd=os.getcwd(), close_fds=True)
-_cmd = [sys.executable, '-c', _src]
-if os.name == 'nt':
-    _flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-    try:
-        subprocess.Popen(_cmd, creationflags=_flags | 0x01000000, **_kw)  # + CREATE_BREAKAWAY_FROM_JOB
-    except OSError:
-        subprocess.Popen(_cmd, creationflags=_flags, **_kw)
-else:
-    subprocess.Popen(_cmd, start_new_session=True, **_kw)
-"""
-
-
-def _detached_launch(rebuild_body: str) -> str:
-    """Return a POSIX-sh line that runs ``rebuild_body`` as a detached background
-    Python process via ``$GRAPHIFY_PYTHON``.
-
-    Replaces the old ``nohup ... &`` form, which failed on Git for Windows'
-    shell (no nohup/setsid) and let the rebuild silently never run (#1161).
-    The launcher writes the child's output to ``$GRAPHIFY_REBUILD_LOG`` and
-    returns the instant the child is spawned, so the git hook never blocks.
-    """
-    launcher = _LAUNCHER_TEMPLATE.replace("__REBUILD_BODY__", rebuild_body)
-    return '"$GRAPHIFY_PYTHON" -c "' + launcher + '"\n'
-
 
 _HOOK_SCRIPT = """\
 # graphify-hook-start
@@ -250,17 +84,8 @@ _HOOK_SCRIPT = """\
 # churn run-to-run. Pinning it makes graphify-out reproducible.
 export PYTHONHASHSEED=0
 
-# Git for Windows/MSYS hooks can inherit fragile pipe handles from GUI clients
-# and agent shells. Keep hook-triggered rebuilds sequential by default there;
-# explicit GRAPHIFY_MAX_WORKERS still wins for users who want parallelism.
-if [ -n "${WINDIR:-}" ] || [ -n "${MSYSTEM:-}" ]; then
-    export GRAPHIFY_MAX_WORKERS="${GRAPHIFY_MAX_WORKERS:-1}"
-fi
-
 # Skip during rebase/merge/cherry-pick to avoid blocking --continue with unstaged changes
-# git exports GIT_DIR to hooks; the rev-parse fallback only runs when invoked by
-# hand (each git exec costs 1s+ on AV-scanned Windows machines).
-GIT_DIR=${GIT_DIR:-$(git rev-parse --git-dir 2>/dev/null)}
+GIT_DIR=$(git rev-parse --git-dir 2>/dev/null)
 [ -d "$GIT_DIR/rebase-merge" ] && exit 0
 [ -d "$GIT_DIR/rebase-apply" ] && exit 0
 [ -f "$GIT_DIR/MERGE_HEAD" ] && exit 0
@@ -282,15 +107,41 @@ fi
 """ + _PYTHON_DETECT + """
 export GRAPHIFY_CHANGED="$CHANGED"
 
-# Run the rebuild detached so git commit returns immediately. Full-repo rebuilds
-# can take hours; blocking the post-commit hook stalls the shell. The Python
-# launcher below detaches the child cross-platform, so it works on Git for
-# Windows' shell too (which lacks the coreutils backgrounding tools) (#1161).
+# Run rebuild detached so git commit returns immediately.
+# Full repo rebuilds can take hours; blocking the post-commit hook stalls the shell.
 _GRAPHIFY_LOG="${HOME}/.cache/graphify-rebuild.log"
 mkdir -p "$(dirname "$_GRAPHIFY_LOG")"
-export GRAPHIFY_REBUILD_LOG="$_GRAPHIFY_LOG"
 echo "[graphify hook] launching background rebuild (log: $_GRAPHIFY_LOG)"
-""" + _detached_launch(_REBUILD_BODY_COMMIT) + """# graphify-hook-end
+nohup "$GRAPHIFY_PYTHON" -c "
+import os, signal, sys
+from pathlib import Path
+
+changed_raw = os.environ.get('GRAPHIFY_CHANGED', '')
+changed = [Path(f.strip()) for f in changed_raw.strip().splitlines() if f.strip()]
+
+if not changed:
+    sys.exit(0)
+
+print(f'[graphify hook] {len(changed)} file(s) changed - rebuilding graph...')
+
+try:
+    from graphify.watch import _rebuild_code, _apply_resource_limits
+    _apply_resource_limits()
+    _timeout = int(os.environ.get('GRAPHIFY_REBUILD_TIMEOUT', '600'))
+    if _timeout > 0 and hasattr(signal, 'SIGALRM'):
+        signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError(f'graphify rebuild exceeded {_timeout}s')))
+        signal.alarm(_timeout)
+    _force = os.environ.get('GRAPHIFY_FORCE', '').lower() in ('1', 'true', 'yes')
+    _rebuild_code(Path('.'), changed_paths=changed, force=_force)
+except TimeoutError as exc:
+    print(f'[graphify hook] {exc}')
+    sys.exit(1)
+except Exception as exc:
+    print(f'[graphify hook] Rebuild failed: {exc}')
+    sys.exit(1)
+" >> "$_GRAPHIFY_LOG" 2>&1 < /dev/null &
+disown 2>/dev/null || true
+# graphify-hook-end
 """
 
 
@@ -303,13 +154,6 @@ _CHECKOUT_SCRIPT = """\
 # order is randomized per-process by PYTHONHASHSEED, so community assignments
 # churn run-to-run. Pinning it makes graphify-out reproducible.
 export PYTHONHASHSEED=0
-
-# Git for Windows/MSYS hooks can inherit fragile pipe handles from GUI clients
-# and agent shells. Keep hook-triggered rebuilds sequential by default there;
-# explicit GRAPHIFY_MAX_WORKERS still wins for users who want parallelism.
-if [ -n "${WINDIR:-}" ] || [ -n "${MSYSTEM:-}" ]; then
-    export GRAPHIFY_MAX_WORKERS="${GRAPHIFY_MAX_WORKERS:-1}"
-fi
 
 PREV_HEAD=$1
 NEW_HEAD=$2
@@ -326,9 +170,7 @@ if [ ! -d "graphify-out" ]; then
 fi
 
 # Skip during rebase/merge/cherry-pick
-# git exports GIT_DIR to hooks; the rev-parse fallback only runs when invoked by
-# hand (each git exec costs 1s+ on AV-scanned Windows machines).
-GIT_DIR=${GIT_DIR:-$(git rev-parse --git-dir 2>/dev/null)}
+GIT_DIR=$(git rev-parse --git-dir 2>/dev/null)
 [ -d "$GIT_DIR/rebase-merge" ] && exit 0
 [ -d "$GIT_DIR/rebase-apply" ] && exit 0
 [ -f "$GIT_DIR/MERGE_HEAD" ] && exit 0
@@ -337,9 +179,31 @@ GIT_DIR=${GIT_DIR:-$(git rev-parse --git-dir 2>/dev/null)}
 """ + _PYTHON_DETECT + """
 _GRAPHIFY_LOG="${HOME}/.cache/graphify-rebuild.log"
 mkdir -p "$(dirname "$_GRAPHIFY_LOG")"
-export GRAPHIFY_REBUILD_LOG="$_GRAPHIFY_LOG"
 echo "[graphify] Branch switched - launching background rebuild (log: $_GRAPHIFY_LOG)"
-""" + _detached_launch(_REBUILD_BODY_CHECKOUT) + """# graphify-checkout-hook-end
+nohup "$GRAPHIFY_PYTHON" -c "
+from graphify.watch import _rebuild_code, _apply_resource_limits
+from pathlib import Path
+import os, signal, sys
+try:
+    _apply_resource_limits()
+    _timeout = int(os.environ.get('GRAPHIFY_REBUILD_TIMEOUT', '600'))
+    if _timeout > 0 and hasattr(signal, 'SIGALRM'):
+        signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError(f'graphify rebuild exceeded {_timeout}s')))
+        signal.alarm(_timeout)
+    _force = os.environ.get('GRAPHIFY_FORCE', '').lower() in ('1', 'true', 'yes')
+    # post-checkout: branch switch can touch arbitrary files; full rebuild path
+    # (no changed_paths) is correct here. The flock inside _rebuild_code still
+    # prevents pile-ups when commit + checkout fire back-to-back.
+    _rebuild_code(Path('.'), force=_force)
+except TimeoutError as exc:
+    print(f'[graphify] {exc}')
+    sys.exit(1)
+except Exception as exc:
+    print(f'[graphify] Rebuild failed: {exc}')
+    sys.exit(1)
+" >> "$_GRAPHIFY_LOG" 2>&1 < /dev/null &
+disown 2>/dev/null || true
+# graphify-checkout-hook-end
 """
 
 
@@ -352,27 +216,6 @@ def _git_root(path: Path) -> Path | None:
     return None
 
 
-_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
-
-
-def _reject_windows_path(value: str, source: str) -> None:
-    """Raise if a hooks path looks like a Windows absolute path (#1385).
-
-    On POSIX/WSL ``Path("C:\\Users\\...").is_absolute()`` is False, so an absolute
-    Windows hooks path gets joined under the repo root and mkdir'd as a literal
-    junk directory (backslashes and all), while install reports success and the
-    real ``.git/hooks`` gets nothing. Fail loudly instead so the user can fix it.
-    """
-    if os.name == "nt":
-        return
-    if _WINDOWS_DRIVE_RE.match(value) or "\\" in value:
-        raise RuntimeError(
-            f"git hooks path from {source} looks like a Windows path: {value!r}. "
-            f"On WSL/POSIX this can't resolve to a real directory. Unset it with "
-            f"`git config --local --unset core.hooksPath`, or set a POSIX path."
-        )
-
-
 def _hooks_dir(root: Path) -> Path:
     """Return the git hooks directory, respecting core.hooksPath if set (e.g. Husky)."""
     try:
@@ -381,7 +224,6 @@ def _hooks_dir(root: Path) -> Path:
         # configparser lowercases option names; git's hooksPath becomes hookspath
         custom = cfg.get("core", "hookspath", fallback="").strip()
         if custom:
-            _reject_windows_path(custom, "core.hooksPath")
             p = Path(custom).expanduser()
             if not p.is_absolute():
                 p = root / p
@@ -421,7 +263,6 @@ def _hooks_dir(root: Path) -> Path:
         # A valid hooks path can never contain newlines or NUL. Their presence
         # means git echoed an unrecognised flag back (old git behaviour).
         if res.returncode == 0 and raw and not any(c in raw for c in ("\n", "\r", "\x00")):
-            _reject_windows_path(raw, "git rev-parse --git-path hooks")
             d = (root / raw).resolve()
             d.mkdir(parents=True, exist_ok=True)
             return d

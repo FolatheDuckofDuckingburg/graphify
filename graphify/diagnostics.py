@@ -274,13 +274,7 @@ def _read_json_file(path: str | Path) -> dict[str, Any]:
 
     json_path = Path(path)
     check_graph_file_size_cap(json_path)
-    try:
-        data = json.loads(json_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        raise RuntimeError(
-            f"Cannot parse {json_path}: {exc}. "
-            "The file may be corrupted — re-run 'graphify extract'."
-        ) from exc
+    data = json.loads(json_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("diagnostic input must be a JSON object")
     return data

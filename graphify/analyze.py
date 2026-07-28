@@ -5,25 +5,10 @@ import networkx as nx
 
 from graphify.build import edge_data
 
-# Builtin/mock names that can appear as annotation-derived nodes in pre-existing
-# graphs. Excluded from god-node ranking so they don't displace real abstractions
-# even if they weren't filtered at extraction time (#1147).
-_BUILTIN_NOISE_LABELS = frozenset({
-    "str", "int", "float", "bool", "bytes", "bytearray", "complex", "object",
-    "True", "False",
-    "MagicMock", "Mock", "AsyncMock", "NonCallableMock",
-    "NonCallableMagicMock", "PropertyMock", "patch", "sentinel",
-    # Python stdlib types commonly confused for project symbols
-    "Path", "Any", "Optional", "List", "Dict", "Set", "Tuple", "Union",
-    "Callable", "Type", "ClassVar", "Final", "Literal", "Protocol",
-    "Counter", "defaultdict", "OrderedDict", "datetime", "Enum",
-    "os", "sys", "re", "json", "io", "abc", "typing",
-})
-
 # Language families — extensions sharing a runtime can legitimately call each other
 _LANG_FAMILY: dict[str, str] = {
     **{e: "python" for e in (".py", ".pyw")},
-    **{e: "js" for e in (".js", ".jsx", ".mjs", ".ejs", ".ts", ".tsx", ".mts", ".cts", ".vue", ".svelte")},
+    **{e: "js" for e in (".js", ".jsx", ".mjs", ".ejs", ".ts", ".tsx", ".vue", ".svelte")},
     **{e: "go" for e in (".go",)},
     **{e: "rust" for e in (".rs",)},
     **{e: "jvm" for e in (".java", ".kt", ".kts", ".scala")},
@@ -108,8 +93,6 @@ def god_nodes(G: nx.Graph, top_n: int = 10) -> list[dict]:
     result = []
     for node_id, deg in sorted_nodes:
         if _is_file_node(G, node_id) or _is_concept_node(G, node_id) or _is_json_key_node(G, node_id):
-            continue
-        if G.nodes[node_id].get("label", "") in _BUILTIN_NOISE_LABELS:
             continue
         result.append({
             "id": node_id,
@@ -663,11 +646,6 @@ def find_import_cycles(
         if rel not in ("imports_from", "re_exports"):
             continue
 
-        # Deferred `import(...)` edges are real dependencies but do not form a
-        # hard file-level cycle, so they are excluded from cycle detection (#1241).
-        if data.get("deferred"):
-            continue
-
         src_file_attr = data.get("source_file", "")
         if not isinstance(src_file_attr, str) or not src_file_attr:
             continue
@@ -696,11 +674,8 @@ def find_import_cycles(
         return []
 
     # Step 2: Find simple cycles, bounded by length.
-    # Pass length_bound so networkx prunes during enumeration rather than
-    # enumerating all elementary cycles and post-filtering — avoids exponential
-    # blowup on dense graphs with many long cycles (#1196).
     cycles: list[list[str]] = []
-    for cycle in nx.simple_cycles(file_graph, length_bound=max_cycle_length):
+    for cycle in nx.simple_cycles(file_graph):
         if len(cycle) <= max_cycle_length:
             cycles.append(cycle)
         if len(cycles) >= top_n * 10:

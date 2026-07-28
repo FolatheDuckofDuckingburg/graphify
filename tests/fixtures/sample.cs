@@ -21,10 +21,6 @@ namespace GraphifyDemo
     {
         private readonly HttpClient _client;
 
-        public Processor Owner { get; set; }
-
-        public List<Processor> Workers { get; set; }
-
         public DataProcessor()
         {
             _client = new HttpClient();

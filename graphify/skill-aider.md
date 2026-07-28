@@ -1,6 +1,7 @@
 ---
 name: graphify
 description: "Use for any question about a codebase, its architecture, file relationships, or project content — especially when graphify-out/ exists, where the question should be treated as a graphify query first. Turns any input (code, docs, papers, images, videos) into a persistent knowledge graph with god nodes, community detection, and query/path/explain tools."
+trigger: /graphify
 ---
 
 # /graphify
@@ -71,7 +72,7 @@ fi
 if [ -z "$PYTHON" ] && [ -n "$GRAPHIFY_BIN" ]; then
     _SHEBANG=$(head -1 "$GRAPHIFY_BIN" | tr -d '#!')
     case "$_SHEBANG" in
-        *[!a-zA-Z0-9/_.@-]*) ;;
+        *[!a-zA-Z0-9/_.-]*) ;;
         *) "$_SHEBANG" -c "import graphify" 2>/dev/null && PYTHON="$_SHEBANG" ;;
     esac
 fi
@@ -177,8 +178,6 @@ After transcription:
 
 This step has two parts: **structural extraction** (deterministic, free) and **semantic extraction** (your AI model, costs tokens).
 
-> **graphify needs no API key. Never ask the user for one, and never block on one.** Code is extracted structurally (AST) with no LLM and no key at all — a code-only corpus (the common `/graphify .` on a repo) skips semantic extraction entirely, so go straight to Part A and skip Part B. Semantic extraction (only for docs, papers, and images) is done by your own model. graphify does **not** read `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or any other provider key. If you cannot dispatch subagents, do not stall: a code-only corpus has no semantic work (write the empty semantic file and continue to Part C); for docs/papers/images, extract them inline yourself. If you catch yourself about to prompt for or block on a missing API key, that is a misread of this skill — proceed without one.
-
 **Run Part A (AST) and Part B (semantic) in parallel. Dispatch all semantic subagents AND start AST extraction in the same message. Both can run simultaneously since they operate on different file types. Merge results in Part C as before.**
 
 Note: Parallelizing AST + semantic saves 5-15s on large corpora. AST is deterministic and fast; start it while subagents are processing docs/papers.
@@ -228,19 +227,12 @@ from graphify.cache import check_semantic_cache
 from pathlib import Path
 
 detect = json.loads(Path('.graphify_detect.json').read_text())
-# Only content files go to semantic extraction. Code is already covered
-# structurally by the AST pass; flattening every category here makes the
-# extraction step re-read every source file (#1392).
-all_files = [f for cat in ('document', 'paper', 'image') for f in detect['files'].get(cat, [])]
+all_files = [f for files in detect['files'].values() for f in files]
 
 cached_nodes, cached_edges, cached_hyperedges, uncached = check_semantic_cache(all_files)
 
-# Always (re)write the cache file: write hits, else DELETE any leftover from a
-# prior run so Part C never merges a stale .graphify_cached.json (#1392).
 if cached_nodes or cached_edges or cached_hyperedges:
     Path('.graphify_cached.json').write_text(json.dumps({'nodes': cached_nodes, 'edges': cached_edges, 'hyperedges': cached_hyperedges}))
-else:
-    Path('.graphify_cached.json').unlink(missing_ok=True)
 Path('.graphify_uncached.txt').write_text('\n'.join(uncached))
 print(f'Cache: {len(all_files)-len(uncached)} files hit, {len(uncached)} files need extraction')
 "
@@ -386,8 +378,6 @@ print(f'Merged: {total} nodes, {edges} edges ({len(ast[\"nodes\"])} AST + {len(s
 
 ### Step 4 - Build graph, cluster, analyze, generate outputs
 
-**Before starting:** the code blocks below pass `directed=IS_DIRECTED` to `build_from_json()`. Replace `IS_DIRECTED` with `True` if `--directed` was given (builds a `DiGraph` preserving edge direction source->target), otherwise `False` (the default undirected `Graph`). Substitute it everywhere it appears, the same way you substitute `INPUT_PATH` - do not leave the literal `IS_DIRECTED` in the code.
-
 ```bash
 mkdir -p graphify-out
 $(cat graphify-out/.graphify_python) -c "
@@ -402,13 +392,7 @@ from pathlib import Path
 extraction = json.loads(Path('.graphify_extract.json').read_text())
 detection  = json.loads(Path('.graphify_detect.json').read_text())
 
-G = build_from_json(extraction, directed=IS_DIRECTED)
-# Guard BEFORE any write: an empty extraction must not clobber a good graph.json /
-# GRAPH_REPORT.md / analysis sidecar. Check immediately after build (#1392).
-if G.number_of_nodes() == 0:
-    print('ERROR: Graph is empty - extraction produced no nodes.')
-    print('Possible causes: all files were skipped, binary-only corpus, or extraction failed.')
-    raise SystemExit(1)
+G = build_from_json(extraction)
 communities = cluster(G)
 cohesion = score_all(G, communities)
 tokens = {'input': extraction.get('input_tokens', 0), 'output': extraction.get('output_tokens', 0)}
@@ -418,15 +402,9 @@ labels = {cid: 'Community ' + str(cid) for cid in communities}
 # Placeholder questions - regenerated with real labels in Step 5
 questions = suggest_questions(G, communities, labels)
 
-# Persist the graph first and only write the report/analysis if it actually
-# persisted - to_json refuses to shrink an existing graph.json (#479), and a
-# report describing a graph we did not write would be a lie (#1392).
-wrote = to_json(G, communities, 'graphify-out/graph.json')
-if not wrote:
-    print('ERROR: refused to shrink graphify-out/graph.json (fewer nodes than the existing graph). Run a full rebuild to be safe.')
-    raise SystemExit(1)
 report = generate(G, communities, cohesion, labels, gods, surprises, detection, tokens, 'INPUT_PATH', suggested_questions=questions)
 Path('graphify-out/GRAPH_REPORT.md').write_text(report)
+to_json(G, communities, 'graphify-out/graph.json')
 
 analysis = {
     'communities': {str(k): v for k, v in communities.items()},
@@ -436,6 +414,10 @@ analysis = {
     'questions': questions,
 }
 Path('.graphify_analysis.json').write_text(json.dumps(analysis, indent=2))
+if G.number_of_nodes() == 0:
+    print('ERROR: Graph is empty - extraction produced no nodes.')
+    print('Possible causes: all files were skipped, binary-only corpus, or extraction failed.')
+    raise SystemExit(1)
 print(f'Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges, {len(communities)} communities')
 "
 ```
@@ -463,7 +445,7 @@ extraction = json.loads(Path('.graphify_extract.json').read_text())
 detection  = json.loads(Path('.graphify_detect.json').read_text())
 analysis   = json.loads(Path('.graphify_analysis.json').read_text())
 
-G = build_from_json(extraction, directed=IS_DIRECTED)
+G = build_from_json(extraction)
 communities = {int(k): v for k, v in analysis['communities'].items()}
 cohesion = {int(k): v for k, v in analysis['cohesion'].items()}
 tokens = {'input': extraction.get('input_tokens', 0), 'output': extraction.get('output_tokens', 0)}
@@ -501,7 +483,7 @@ extraction = json.loads(Path('.graphify_extract.json').read_text())
 analysis   = json.loads(Path('.graphify_analysis.json').read_text())
 labels_raw = json.loads(Path('.graphify_labels.json').read_text()) if Path('.graphify_labels.json').exists() else {}
 
-G = build_from_json(extraction, directed=IS_DIRECTED)
+G = build_from_json(extraction)
 communities = {int(k): v for k, v in analysis['communities'].items()}
 cohesion = {int(k): v for k, v in analysis['cohesion'].items()}
 labels = {int(k): v for k, v in labels_raw.items()}
@@ -532,7 +514,7 @@ extraction = json.loads(Path('.graphify_extract.json').read_text())
 analysis   = json.loads(Path('.graphify_analysis.json').read_text())
 labels_raw = json.loads(Path('.graphify_labels.json').read_text()) if Path('.graphify_labels.json').exists() else {}
 
-G = build_from_json(extraction, directed=IS_DIRECTED)
+G = build_from_json(extraction)
 communities = {int(k): v for k, v in analysis['communities'].items()}
 labels = {int(k): v for k, v in labels_raw.items()}
 
@@ -555,7 +537,7 @@ from graphify.build import build_from_json
 from graphify.export import to_cypher
 from pathlib import Path
 
-G = build_from_json(json.loads(Path('.graphify_extract.json').read_text()), directed=IS_DIRECTED)
+G = build_from_json(json.loads(Path('.graphify_extract.json').read_text()))
 to_cypher(G, 'graphify-out/cypher.txt')
 print('cypher.txt written - import with: cypher-shell < graphify-out/cypher.txt')
 "
@@ -573,7 +555,7 @@ from pathlib import Path
 
 extraction = json.loads(Path('.graphify_extract.json').read_text())
 analysis   = json.loads(Path('.graphify_analysis.json').read_text())
-G = build_from_json(extraction, directed=IS_DIRECTED)
+G = build_from_json(extraction)
 communities = {int(k): v for k, v in analysis['communities'].items()}
 
 result = push_to_neo4j(G, uri='NEO4J_URI', user='NEO4J_USER', password='NEO4J_PASSWORD', communities=communities)
@@ -596,7 +578,7 @@ extraction = json.loads(Path('.graphify_extract.json').read_text())
 analysis   = json.loads(Path('.graphify_analysis.json').read_text())
 labels_raw = json.loads(Path('.graphify_labels.json').read_text()) if Path('.graphify_labels.json').exists() else {}
 
-G = build_from_json(extraction, directed=IS_DIRECTED)
+G = build_from_json(extraction)
 communities = {int(k): v for k, v in analysis['communities'].items()}
 labels = {int(k): v for k, v in labels_raw.items()}
 
@@ -617,7 +599,7 @@ from pathlib import Path
 extraction = json.loads(Path('.graphify_extract.json').read_text())
 analysis   = json.loads(Path('.graphify_analysis.json').read_text())
 
-G = build_from_json(extraction, directed=IS_DIRECTED)
+G = build_from_json(extraction)
 communities = {int(k): v for k, v in analysis['communities'].items()}
 
 to_graphml(G, communities, 'graphify-out/graph.graphml')
@@ -676,7 +658,7 @@ from graphify.detect import save_manifest
 
 # Save manifest for --update
 detect = json.loads(Path('.graphify_detect.json').read_text())
-save_manifest(detect['files'], root='INPUT_PATH')
+save_manifest(detect['files'])
 
 # Update cumulative cost tracker
 extract = json.loads(Path('.graphify_extract.json').read_text())
@@ -702,7 +684,7 @@ cost_path.write_text(json.dumps(cost, indent=2))
 print(f'This run: {input_tok:,} input tokens, {output_tok:,} output tokens')
 print(f'All time: {cost[\"total_input_tokens\"]:,} input, {cost[\"total_output_tokens\"]:,} output ({len(cost[\"runs\"])} runs)')
 "
-rm -f .graphify_detect.json .graphify_extract.json .graphify_ast.json .graphify_semantic.json .graphify_analysis.json .graphify_labels.json; find . -maxdepth 1 -name '.graphify_chunk_*.json' -delete 2>/dev/null
+rm -f .graphify_detect.json .graphify_extract.json .graphify_ast.json .graphify_semantic.json .graphify_analysis.json .graphify_labels.json .graphify_chunk_*.json
 rm -f graphify-out/.needs_update 2>/dev/null || true
 ```
 
@@ -814,7 +796,7 @@ G_existing = json_graph.node_link_graph(existing_data, edges='links')
 
 # Load new extraction
 new_extraction = json.loads(Path('.graphify_extract.json').read_text())
-G_new = build_from_json(new_extraction, directed=IS_DIRECTED)
+G_new = build_from_json(new_extraction)
 
 # Merge: new nodes/edges into existing graph
 G_existing.update(G_new)
@@ -838,7 +820,7 @@ from pathlib import Path
 # Load old graph (before update) from backup written before merge
 old_data = json.loads(Path('.graphify_old.json').read_text()) if Path('.graphify_old.json').exists() else None
 new_extract = json.loads(Path('.graphify_extract.json').read_text())
-G_new = build_from_json(new_extract, directed=IS_DIRECTED)
+G_new = build_from_json(new_extract)
 
 if old_data:
     G_old = json_graph.node_link_graph(old_data, edges='links')
