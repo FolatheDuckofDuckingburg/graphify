@@ -137,12 +137,19 @@ def test_windsurf_cli_project(tmp_path):
 
 
 def test_windsurf_cli_main_subcommand(tmp_path):
-    # Mock sys.argv to simulate calling the CLI subcommand
-    test_args = ["graphify", "windsurf", "install", "--project"]
-
-    # We patch Path.cwd to return tmp_path so it operates in a sandbox
-    with patch.object(sys, "argv", test_args), \
-         patch.object(Path, "cwd", return_value=tmp_path), \
-         patch("graphify.__main__._project_install") as mock_project_install:
+    # Test end-to-end CLI integration for install
+    test_args_install = ["graphify", "windsurf", "install", "--project"]
+    with patch.object(sys, "argv", test_args_install), \
+         patch.object(Path, "cwd", return_value=tmp_path):
         m.main()
-        mock_project_install.assert_called_once_with("windsurf", Path("."))
+
+    config_file = tmp_path / ".codeium" / "config.json"
+    assert config_file.exists()
+
+    # Test end-to-end CLI integration for uninstall
+    test_args_uninstall = ["graphify", "windsurf", "uninstall", "--project"]
+    with patch.object(sys, "argv", test_args_uninstall), \
+         patch.object(Path, "cwd", return_value=tmp_path):
+        m.main()
+
+    assert not config_file.exists()
