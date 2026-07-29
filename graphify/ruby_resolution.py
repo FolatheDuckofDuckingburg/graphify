@@ -32,7 +32,7 @@ def _key(label: str) -> str:
 # (``Processor``, ``TaxCalculator``); methods end in ``()`` and files in ``.rb``.
 # Lets us register method-less containers (a ``Class.new(StandardError)`` error
 # class, an empty module) that have no `method` edge to be found by.
-_BARE_CONST_RE = re.compile(r"^[A-Z][A-Za-z0-9_]*$")
+_BARE_CONST_RE = re.compile(r"^[A-Z][A-Za-z0-9_]*(?:::[A-Z][A-Za-z0-9_]*)*$")
 
 
 def _ruby_raw_calls(per_file: list[dict]) -> list[dict]:
@@ -44,7 +44,7 @@ def _ruby_raw_calls(per_file: list[dict]) -> list[dict]:
             if not isinstance(rc, dict):
                 continue
             sf = str(rc.get("source_file", ""))
-            if sf.endswith(".rb"):
+            if sf.endswith((".rb", ".rake")):
                 calls.append(rc)
     return calls
 
@@ -83,7 +83,7 @@ def resolve_ruby_member_calls(
     for n in all_nodes:
         nid = n.get("id")
         sf = str(n.get("source_file", ""))
-        if nid and sf.endswith(".rb") and _BARE_CONST_RE.match(str(n.get("label", ""))):
+        if nid and sf.endswith((".rb", ".rake")) and _BARE_CONST_RE.match(str(n.get("label", ""))):
             class_def_nids.setdefault(_key(n.get("label", "")), []).append(str(nid))
     for k in list(class_def_nids):
         class_def_nids[k] = sorted(set(class_def_nids[k]))
@@ -113,6 +113,26 @@ def resolve_ruby_member_calls(
             "weight": 1.0,
         })
 
+    # Build maps for mixin resolution
+    all_class_nids = set()
+    for nids in class_def_nids.values():
+        all_class_nids.update(nids)
+
+    def _segment_path(path_str: str) -> list[str]:
+        return [s.strip().lower() for s in path_str.split("::") if s.strip()]
+
+    fq_label_map: dict[tuple[str, ...], list[str]] = {}
+    last_segment_map: dict[str, list[str]] = {}
+    for nid in all_class_nids:
+        cnode = node_by_id.get(nid)
+        if cnode is None:
+            continue
+        label = str(cnode.get("label", ""))
+        segs = _segment_path(label)
+        if segs:
+            fq_label_map.setdefault(tuple(segs), []).append(nid)
+            last_segment_map.setdefault(segs[-1], []).append(nid)
+
     # `include`/`extend`/`prepend <Const>` mixins (#1668): resolve the module by
     # its constant name to the single owning module/class node and emit a
     # `mixes_in` edge, under the same single-definition god-node guard. An
@@ -124,7 +144,31 @@ def resolve_ruby_member_calls(
         module_name = rc.get("callee")
         if not caller or not module_name:
             continue
-        target = _unique_class(str(module_name))
+
+        caller_node = node_by_id.get(caller)
+        caller_label = caller_node.get("label", "") if caller_node else ""
+        caller_segs = _segment_path(caller_label)
+        ref_segs = _segment_path(str(module_name))
+        if not ref_segs:
+            continue
+
+        target = None
+        # Try relative/lexical lookup first
+        for i in range(len(caller_segs), -1, -1):
+            candidate_tuple = tuple(caller_segs[:i] + ref_segs)
+            nids = fq_label_map.get(candidate_tuple, [])
+            if len(nids) == 1:
+                target = nids[0]
+                break
+            elif len(nids) > 1:
+                break
+
+        # Fall back to last-segment only when unambiguous and ref_segs is a single segment
+        if target is None and len(ref_segs) == 1:
+            nids = last_segment_map.get(ref_segs[0], [])
+            if len(nids) == 1:
+                target = nids[0]
+
         if target is not None:
             _emit(caller, target, rc, relation="mixes_in", context="mixin")
 
