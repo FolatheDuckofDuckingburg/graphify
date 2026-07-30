@@ -4912,18 +4912,6 @@ def _resolve_cpp_member_calls(
         # extractor-stamped `lang` tag — not the suffix — is the unambiguous gate).
         if rc.get("lang") != "cpp":
             continue
-            continue
-        receiver = rc.get("receiver")
-        callee = rc.get("callee")
-        caller = rc.get("caller_nid")
-        if not receiver or not callee or not caller:
-            continue
-        src_file = rc.get("source_file", "")
-        # Only resolve C++ raw_calls (other languages share the raw_calls list;
-        # a `.h` may route to either extract_cpp or extract_objc by content, so the
-        # extractor-stamped `lang` tag — not the suffix — is the unambiguous gate).
-        if rc.get("lang") != "cpp":
-            continue
         # Determine the receiver's type and the resulting confidence.
         if receiver == "this":
             # this->bar(): receiver is the caller's own enclosing class.
@@ -5265,186 +5253,6 @@ def _resolve_java_member_calls(
                 "source_location": raw_call.get("source_location"),
                 "weight": 1.0,
             })
-
-
-def _resolve_objc_member_calls(
-    per_file: list[dict],
-    all_nodes: list[dict],
-    all_edges: list[dict],
-) -> None:
-    """Resolve cross-file Objective-C message sends (``[recv sel]``) to the real
-    definition of the receiver's type (#1556).
-
-    The ObjC extractor keeps its same-file selector matching (alloc/init refs,
-    dot-syntax accesses, @selector) and additionally emits ``raw_calls`` for every
-    message send, with the receiver and the reconstructed selector as the callee.
-    This pass types the receiver and emits a cross-file ``calls`` edge ONLY when the
-    type resolves to exactly ONE definition (the god-node guard).
-
-    Receiver typing:
-      * ``self`` / ``super`` — the caller's own enclosing class -> EXTRACTED.
-      * Capitalized receiver (``[Foo new]``) — the type named explicitly -> EXTRACTED.
-      * ``[f doThing]`` — ``f`` typed via the file's ``Foo *f`` local table -> INFERRED.
-    An uninferable receiver is SKIPPED (no guess), so an ambiguous selector across
-    classes never fans out. ``_merge_decl_def_classes`` folds each @interface/@impl
-    pair into one node, so a paired class clears the single-definition guard.
-
-    Must run after id-disambiguation so node ids and caller_nids are final.
-    """
-    type_table_by_file: dict[str, dict[str, str]] = {}
-    for result in per_file:
-        tt = result.get("objc_type_table")
-        if tt and tt.get("path"):
-            type_table_by_file[tt["path"]] = tt.get("table", {})
-
-    def _key(label: str) -> str:
-        return re.sub(r"[^a-zA-Z0-9]+", "", str(label)).lower()
-
-    contained = {e.get("target") for e in all_edges if e.get("relation") == "contains"}
-
-    type_def_nids: dict[str, list[str]] = {}
-    node_by_id: dict[str, dict] = {}
-    for n in all_nodes:
-        node_by_id[n.get("id")] = n
-        if n.get("source_file") and n.get("id") in contained and _is_type_like_definition(n):
-            type_def_nids.setdefault(_key(n.get("label", "")), []).append(n["id"])
-
-    method_index: dict[tuple[str, str], str] = {}
-    enclosing_type: dict[str, str] = {}
-    for e in all_edges:
-        if e.get("relation") != "method":
-            continue
-        src, tgt = e.get("source"), e.get("target")
-        enclosing_type.setdefault(tgt, src)
-        tnode = node_by_id.get(tgt)
-        if tnode is not None:
-            # ObjC method labels carry a +/- sigil (`-doThing`); strip it so the
-            # selector `doThing` keys to the method.
-            method_index[(src, _key(tnode.get("label", "")))] = tgt
-
-    all_raw_calls: list[dict] = []
-    for result in per_file:
-        all_raw_calls.extend(result.get("raw_calls", []))
-
-    existing_pairs = {(e.get("source"), e.get("target")) for e in all_edges}
-    for rc in all_raw_calls:
-        if not rc.get("is_member_call"):
-            continue
-        receiver = rc.get("receiver")
-        callee = rc.get("callee")
-        caller = rc.get("caller_nid")
-        if not receiver or not callee or not caller:
-            continue
-        src_file = rc.get("source_file", "")
-        if rc.get("lang") != "objc":
-            continue
-        if receiver in ("self", "super"):
-            type_nid = enclosing_type.get(caller)
-            if not type_nid:
-                continue
-            type_qualified = True
-        elif receiver[:1].isupper():
-            type_defs = type_def_nids.get(_key(receiver), [])
-            if len(type_defs) != 1:  # ambiguous or absent -> bail (god-node guard)
-                continue
-            type_nid = type_defs[0]
-            type_qualified = True
-        else:
-            type_name = type_table_by_file.get(src_file, {}).get(receiver)
-            if not type_name:
-                continue
-            type_defs = type_def_nids.get(_key(type_name), [])
-            if len(type_defs) != 1:  # ambiguous or absent -> bail (god-node guard)
-                continue
-            type_nid = type_defs[0]
-            type_qualified = False
-        method_nid = method_index.get((type_nid, _key(callee)))
-        target = method_nid or type_nid
-        relation = "calls" if method_nid else "references"
-        if target == caller or (caller, target) in existing_pairs:
-            continue
-        existing_pairs.add((caller, target))
-        all_edges.append({
-            "source": caller,
-            "target": target,
-            "relation": relation,
-            "context": "call",
-            "confidence": "EXTRACTED" if type_qualified else "INFERRED",
-            "confidence_score": 1.0 if type_qualified else 0.8,
-            "source_file": src_file,
-            "source_location": rc.get("source_location"),
-            "weight": 1.0,
-        })
-
-
-# Register the cross-file, language-specific member-call resolvers into the shared
-# registry (framework lives in graphify.resolver_registry). A new language plugs in
-# by adding one register() call below — no edits to extract()'s body. Order
-# preserved from the prior inlined wiring: Swift (#1356) before Python (#1446).
-register_language_resolver(
-    LanguageResolver("swift_member_calls", frozenset({".swift"}), _resolve_swift_member_calls)
-)
-register_language_resolver(
-    LanguageResolver("python_member_calls", frozenset({".py"}), _resolve_python_member_calls)
-)
-# Ruby type-aware member-call resolution (Class.new + typed var.method). Lives in
-# graphify.ruby_resolution; registered here as a second consumer of the framework.
-register_language_resolver(
-    LanguageResolver("ruby_member_calls", frozenset({".rb", ".rake"}), resolve_ruby_member_calls)
-)
-register_language_resolver(
-    LanguageResolver("typescript_member_calls", frozenset({".ts", ".tsx", ".mts", ".cts", ".js", ".jsx"}), _resolve_typescript_member_calls)
-)
-# C++ (#1547) and ObjC (#1556) receiver-typed member-call resolution. `.h` is in
-# both suffix sets because it routes to extract_cpp or extract_objc by content; the
-# resolvers each claim only their own raw_calls via the extractor-stamped `lang`.
-register_language_resolver(
-    LanguageResolver(
-        "cpp_member_calls",
-        frozenset({".cpp", ".cc", ".cxx", ".hpp", ".cu", ".cuh", ".metal", ".h"}),
-        _resolve_cpp_member_calls,
-    )
-)
-register_language_resolver(
-    LanguageResolver(
-        "objc_member_calls",
-        frozenset({".m", ".mm", ".h"}),
-        _resolve_objc_member_calls,
-    )
-)
-# C# receiver-typed member-call resolution (#1609): `field/param/local.Method()`
-# bound to the receiver's declared type instead of a bare same-named match.
-register_language_resolver(
-    LanguageResolver("csharp_member_calls", frozenset({".cs"}), _resolve_csharp_member_calls)
-)
-register_language_resolver(
-    LanguageResolver("java_member_calls", frozenset({".java"}), _resolve_java_member_calls)
-)
-# Pascal/Delphi cross-file inherited-method-call resolution: a call from a
-# manual descendant class to a method it inherits from an ancestor declared
-# in a DIFFERENT file (the common generated-base/manual-descendant split,
-# e.g. Sistec's Th0Xxx/Th5Xxx) falls outside the per-file extractor's own
-# scope. Lives in graphify.pascal_resolution; registered here as a consumer
-# of the framework, same as the Ruby resolver above.
-register_language_resolver(
-    LanguageResolver(
-        "pascal_inherited_calls",
-        frozenset({".pas", ".pp", ".dpr", ".dpk", ".inc"}),
-        resolve_pascal_inherited_calls,
-    )
-)
-
-
-# Inline markdown link: [text](target "optional title"). The negative lookbehind
-# excludes images (![alt](src)). The target stops at whitespace/closing paren so
-# an optional "title" after the URL is dropped; an optional <...> wrapper is too.
-# Reference-style link definition line: [label]: target "optional title"
-# Obsidian-style wikilink: [[target]] / [[target|alias]] / [[target#anchor]].
-
-# Extensions graphify creates document file nodes for. A link to one of these
-# resolves to that file's node; links to code/assets are skipped (left to the
-# language extractors).
-
 
 
 def _resolve_objc_member_calls(
@@ -7525,10 +7333,6 @@ def extract(
                 if nid.startswith(new_pref + "_"):
                     canonical_nid = nid
                     break
-                    break
-                if nid.startswith(new_pref + "_"):
-                    canonical_nid = nid
-                    break
             if canonical_nid is None:
                 continue
             # Named alias imports/re-exports can retain an absolute-prefixed target
@@ -7619,29 +7423,6 @@ def extract(
                 if pref and target.startswith(pref + "_"):
                     return canonical, target[len(pref) + 1:]
             return None
-
-        # (canonical file id, symbol) → set of owned targets, learned from
-        # symbol-level re_exports edges that already point at a real node. A set
-        # (not last-write-wins): when a barrel re-exports the SAME local name
-        # from two different modules (`export {x} from './a'; export {x as y}
-        # from './b'` — both key on local name `x`), the key becomes ambiguous
-        # and must NOT be guessed, or we fabricate a wrong edge. Ambiguous keys
-        # resolve to None so the edge falls to the dangling-canonical fallback
-        # (dropped at build), while the shared resolver's correct edge survives.
-        chain: dict[tuple[str, str], set] = {}
-
-        def _resolve1(key) -> "str | None":
-            targets = chain.get(key)
-            return next(iter(targets)) if targets and len(targets) == 1 else None
-
-        def _learn(e: dict) -> None:
-            tf = e.get("target_file")
-            if not tf or e.get("target") not in owned_ids:
-                return
-            dec = _decompose(e.get("target", ""), tf)
-            if dec is not None:
-                chain.setdefault((e.get("source"), dec[1]), set()).add(e["target"])
-
 
         # (canonical file id, symbol) → set of owned targets, learned from
         # symbol-level re_exports edges that already point at a real node. A set
@@ -8138,16 +7919,6 @@ def extract(
         except (OSError, RuntimeError):
             sf_resolved = sf_path
         keys = tuple({_make_id(str(sf_path)), _make_id(str(sf_resolved))})
-        # Learn the STEM (extension-dropped) forms too: symbol producers mint
-        # compound ids as _make_id(_file_stem(path), name), so a node-less
-        # absolute-derived endpoint arrives as <stem-key>_<symbol> and only
-        # the stem prefix can identify the file it came from (#2262).
-        keys = tuple({
-            _make_id(str(sf_path)),
-            _make_id(str(sf_resolved)),
-            _make_id(_file_stem(sf_path)),
-            _make_id(_file_stem(sf_resolved)),
-        })
         entry = (new_sf, canonical_id, keys)
         _sf_forms[sf] = entry
         return entry
@@ -8184,21 +7955,6 @@ def extract(
                 return ext_id_remap[nid]
             if nid.endswith(_ENTRY) and nid[: -len(_ENTRY)] in ext_id_remap:
                 return ext_id_remap[nid[: -len(_ENTRY)]] + _ENTRY
-            if nid not in owned_ids:
-                # Node-less suffixed-compound endpoint (#2262): an id minted
-                # as _make_id(<absolute stem>, <symbol>) by a producer that
-                # never materialized the node. No node ever registers it, so
-                # rewrite by longest learned prefix: the endpoint stays
-                # dangling (no node is fabricated) but becomes
-                # machine-portable. Ids owned by real nodes are never
-                # touched (guard above), and only absolute-path-derived
-                # prefixes are in ext_id_remap, so ordinary ids can't match.
-                idx = nid.rfind("_")
-                while idx > 0:
-                    canonical = ext_id_remap.get(nid[:idx])
-                    if canonical is not None:
-                        return canonical + nid[idx:]
-                    idx = nid.rfind("_", 0, idx)
             return nid
 
         for n in all_nodes:
