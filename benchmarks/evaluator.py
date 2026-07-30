@@ -75,10 +75,11 @@ class TaskEvaluator:
             return False
 
     def _check_imports(self, code: str) -> bool:
-        """Check that all imports can be resolved."""
+        """Check that all imports can be resolved safely without executing code."""
         try:
             # Try to parse and extract imports
             import ast
+            import importlib.util
 
             tree = ast.parse(code)
             imports = []
@@ -91,13 +92,15 @@ class TaskEvaluator:
                     if node.module:
                         imports.append(node.module)
 
-            # Try to import each one
+            # Try to resolve each spec safely
             for imp in imports:
+                root_pkg = imp.split('.')[0]
                 try:
-                    __import__(imp)
-                except ImportError:
-                    # Some imports may not be available; be lenient
-                    pass
+                    spec = importlib.util.find_spec(root_pkg)
+                    if spec is None:
+                        return False
+                except Exception:
+                    return False
 
             return True
 
