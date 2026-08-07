@@ -624,7 +624,7 @@ def test_semantic_prune_removes_orphan_entries(tmp_path):
     h_a = file_hash(f, tmp_path)
     save_cached(f, {"nodes": [{"id": "a"}], "edges": []}, root=tmp_path, kind="semantic")
 
-    f.write_text("# B\n\nContent B.\n")
+    f.write_text("# B\n\nContent B has a different size.\n")
     h_b = file_hash(f, tmp_path)
     save_cached(f, {"nodes": [{"id": "b"}], "edges": []}, root=tmp_path, kind="semantic")
 
@@ -885,7 +885,7 @@ def test_semantic_prune_sweeps_both_namespaces_against_same_live_set(tmp_path):
     save_semantic_cache([{"id": "da", "source_file": "doc.md"}], [],
                         root=tmp_path, mode="deep")
 
-    f.write_text("# B\n\nContent B.\n")
+    f.write_text("# B\n\nContent B has a different size.\n")
     h_live = file_hash(f, tmp_path)
     save_semantic_cache([{"id": "pb", "source_file": "doc.md"}], [], root=tmp_path)
     save_semantic_cache([{"id": "db", "source_file": "doc.md"}], [],
