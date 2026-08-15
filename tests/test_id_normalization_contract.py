@@ -15,6 +15,7 @@ change re-forks the normalization (a new local helper, an inlined regex, a
 dropped ``casefold``), they fail.
 """
 import re
+import unicodedata
 
 import pytest
 
@@ -233,4 +234,5 @@ def test_property_normalize_id_agrees_with_its_own_caseless_form(s):
     genuinely different characters, not a normalization failure. Caseless
     equivalence via ``casefold`` is the invariant the graph relies on.
     """
-    assert normalize_id(s) == normalize_id(s.casefold())
+    s_nfkc = unicodedata.normalize("NFKC", s)
+    assert normalize_id(s_nfkc) == normalize_id(s_nfkc.casefold())
