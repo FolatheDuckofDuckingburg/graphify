@@ -1,13 +1,37 @@
 # Changelog
 
-Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
+Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
-## 0.9.32 (unreleased)
-## 0.9.35 (unreleased)
-## 0.9.36 (unreleased)
-## 0.9.38 (unreleased)
-## 0.9.40 (unreleased)
-## 0.9.42 (unreleased)
+## 0.9.45 (unreleased)
+
+- Fix: `graphify install <platform>` now advances the `.graphify_version` stamp only for the platform it actually (re)writes, instead of stamping every installed platform as current; a platform whose skill content was left untouched keeps its old stamp so its staleness warning stays truthful (#2694, thanks @ousamabenyounes). This completes #2694 (the CLAUDE_CONFIG_DIR half shipped in 0.9.44).
+- Fix: an incremental rebuild no longer collapses the whole graph when the `.graphify_root` marker records a subfolder while stored `source_file` paths are relative to the repo root; the marker is validated against the stored paths before it is trusted as their anchor, so a mismatched marker can't make every unchanged source look deleted (#2603, thanks @catpotd). A genuinely deleted source is still evicted, and incremental ids stay identical to a cold build.
+- Fix: a Go file that declares both an exported and an unexported symbol differing only by case (e.g. `Run` and `run`, which are distinct in Go's case-sensitive visibility rules) no longer collapses them onto one node id and drops one; the exported symbol keeps its stable id and the unexported one is disambiguated, so an intra-file call to the unexported symbol resolves locally instead of phantoming to another package (#2779, thanks @catpotd). Only the Go extractor's id assignment is affected; the shared id normalization is unchanged, so no other language's ids move.
+- Fix: loading a `graph.json` that contains a hyperedge with no `id` field (the semantic extractor emits them and they persist verbatim) no longer crashes the incremental re-extract with `KeyError: 'id'`; id-less hyperedges are tolerated and retained (#2775, thanks @ousamabenyounes).
+
+## 0.9.44 (2026-08-15)
+
+- Feature: `graphify hook install` reads a committed `.graphifyrc` (`viz_node_limit=<int>`) and bakes the visualization node limit into the generated git hooks, so a project-wide limit is shared via version control and survives hook regeneration; `hook status` reports it (#2760, thanks @hopstreax). The baked value uses a `${GRAPHIFY_VIZ_NODE_LIMIT:-<n>}` default so an explicit per-run env var still wins, and `hook status` degrades gracefully on a malformed `.graphifyrc`.
+- Fix: `graphify install` (Claude always-on) now writes the CLAUDE.md registration into `$CLAUDE_CONFIG_DIR` when that env var relocates the Claude profile, instead of always mutating the default `~/.claude/CLAUDE.md` (part of #2694, thanks @AromalBiju1).
+- Fix: a JS/TS inline or nested function expression — including a generator function expression (`function*(k){…}`) — no longer fabricates an INFERRED `indirect_call` when one of its parameters/locals shares a name with an unrelated callable; the expression's own bindings now shadow the name (#2752, thanks @imagineers-tyler), completing the shadow family alongside catch/arrow/loop/external-import (#2757).
+- Fix: a git-tracked file that also matches a `.gitignore` pattern (a committed file later added to `.gitignore`, or a force-added one) is no longer dropped from the corpus, matching git's own behavior of never un-tracking such a file; `.graphifyignore`/`--exclude` stay authoritative and a non-git corpus is unaffected (#2759, thanks @NithishKumar04). The `git ls-files` probe is skipped entirely when no `.gitignore` is in play, so ordinary corpora pay nothing for it.
+
+- Fix: doctest/Catch2 string-named test cases (`TEST_CASE("...")`, `SCENARIO`, `TEST_CASE_TEMPLATE`), which tree-sitter-cpp drops as ERROR nodes, are recovered as callable nodes contained by the file (#2594, thanks @ousamabenyounes); a punctuation-only test name gets a distinct line-positional id instead of collapsing onto the file-stem id.
+- Fix: `graphify affected` resolves an absolute-path seed against the repo root derived from the graph's own location instead of the current working directory, so a blast-radius query with an absolute seed run from anywhere (an editor, a script) no longer silently returns nothing; a seed outside the root still misses cleanly (#2706, thanks @ousamabenyounes).
+- Fix: a lazy CommonJS `require(...)` inside a function body (the idiom for breaking circular dependencies) now emits the same `imports_from`/`imports` dependency edges as a top-level require, attributed to the enclosing function, instead of being silently dropped; a dynamic `require(variable)` is still skipped (#2700, thanks @rajanpanth).
+- Fix: a JS/TS identifier bound by an import whose target resolves outside the scanned corpus (e.g. a `lucide-react` icon) is now shadowed, so using it as a value no longer fabricates an INFERRED `indirect_call` onto an unrelated same-named callable elsewhere in the corpus; a relative/in-corpus import still resolves to its real target (#2757, thanks @phudayyy).
+- Fix: an OCaml qualified call `M.f` to an external module (one not defined in the same file, e.g. Hardcaml's `Reg_spec.create`) no longer binds to a same-named local `let f` — which produced a false `calls` edge and, when the caller was that local `f`, a `f -> f` self-loop. External qualified calls are kept as a distinct target labelled by the full path; unqualified calls and calls into a locally-defined module still resolve locally, and cross-file `Geo.area` still collapses onto another file's `area`.
+
+## 0.9.43 (2026-08-14)
+
+- Feature: OCaml `.ml`/`.mli` extraction via tree-sitter-ocaml (optional `[ocaml]` extra). Extracts modules, top-level and module-level values/functions, types and their variant constructors, `open` imports, and function calls; qualified calls (`Geo.area`) resolve to the value, and cross-file `open`/call targets collapse onto the unique real definition via the corpus stub rewire.
+- Fix: a cross-file INFERRED `uses` edge now binds to the symbol whose body actually references the imported name (a module-level function is a valid source; a co-located class that never touches the import gets no edge), instead of fanning out from the import line to every class in the importing file (#2652, thanks @ousamabenyounes). A reference at module top level, with no enclosing symbol, emits no edge.
+- Fix: a named `function` declaration nested inside another function now gets its own node, a `contains` edge from the enclosing function, and its own call scope, so calls made from inside it are no longer dropped as dangling (#2653, thanks @himanshupatro-334). Coverage was extended to the arrow idioms too: a function declared inside an arrow-defined component (`const Panel = () => { function handleClick(){} }`) or inside an arrow callback (`useEffect(() => { function h(){} })`) is captured and attributed to the nearest enclosing named scope.
+- Fix: the Bash extractor resolves two more `source` path forms — `source "$(dirname "$VAR")/lib/x.sh"` and a `..` suffix on a tracked-variable base (`source "$VAR/../lib/x.sh"`) — so those cross-file source edges are no longer silently dropped (#2596, thanks @hudsonwa). A `..` on a *guessed* base is still rejected, and a tracked-base `..` cannot walk past the base's parent to an arbitrary host path, so a hostile corpus can't make the extractor stat or record an out-of-tree file.
+- Fix: a wiki article link now targets the article's filename verbatim instead of a percent-encoded twin, so a label with `( ) & #` or non-ASCII characters no longer produces a link that names no file on disk; the link and the on-disk filename share one canonicalization (#2597, thanks @abhay-codes07).
+- Fix: export filenames are now budgeted against the full destination path rather than only the per-component `NAME_MAX`, so a long output directory on Windows no longer pushes an Obsidian/wiki note path past `MAX_PATH` and aborts the export mid-write (#2655, thanks @abhay-codes07). The collision-suffix reserve was widened so a four-digit dedup suffix can't overrun the budget.
+
+## 0.9.42 (2026-08-13)
 
 - Fix: a JS/TS `for...of` / `for...in` loop binding is now shadowed, so passing it as a call argument no longer fabricates an `indirect_call` edge to an unrelated same-named callable (#2685, thanks @ousamabenyounes); completes the loop/closure/catch shadow family (#2568/#2569/#2517).
 - Fix: graph provenance (`built_at_commit`) is stamped from the analysed repository rather than the shell's working directory, so `graphify extract` run from elsewhere records the target's commit, not the caller's (#2534 family; #2699, thanks @C0KERNEL).
