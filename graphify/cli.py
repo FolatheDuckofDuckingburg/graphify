@@ -12,7 +12,7 @@ import re
 import sys
 import time
 from graphify.paths import GRAPHIFY_OUT as _GRAPHIFY_OUT
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 
 _SEARCH_NUDGE = json.dumps({
@@ -663,7 +663,7 @@ def _run_hook_guard(kind: str, strict: bool = False) -> None:
                 in_project = False
                 for v in explicit:
                     p = Path(v)
-                    if not p.is_absolute():
+                    if _is_cwd_relative(v):
                         in_project = True  # relative -> anchored at cwd == in project
                         break
                     try:
@@ -708,6 +708,33 @@ def _run_hook_guard(kind: str, strict: bool = False) -> None:
             sys.stdout.write(_READ_NUDGE)
     except Exception:
         pass
+
+
+def _is_cwd_relative(value: str) -> bool:
+    r"""Whether *value* is anchored at the current working directory.
+
+    The hook's out-of-project guard needs "is this path resolved against cwd?",
+    and ``Path.is_absolute()`` is the wrong question for it on Windows. A
+    driveless rooted path like ``/tmp/x.py`` — the form POSIX-shaped hosts, WSL
+    and Git Bash send — is NOT absolute there (no drive letter), but it is not
+    cwd-relative either: Windows anchors it at the current DRIVE root, so
+    ``Path("/somewhere/else/x.py").resolve()`` is ``C:\somewhere\else\x.py``,
+    which is outside the project unless the project sits at ``C:\``. Reading it
+    as cwd-relative made the guard declare it in-project and emit the read nudge
+    (and, in strict mode, the once-per-session deny) for files the graph has
+    nothing to say about.
+
+    ``C:x.py`` is the same trap from the other side: drive-relative, anchored at
+    that drive's current directory rather than cwd.
+
+    So the test is "no root and no drive", not "not absolute". These stay the
+    host's own rules — the path is about to be resolved against this filesystem,
+    so ``paths.is_absolute_any_platform`` (for stored, portable paths) is
+    deliberately not used. On POSIX ``root`` is set exactly when the path is
+    absolute and ``drive`` is always empty, so this is unchanged there.
+    """
+    pure = PureWindowsPath(value) if os.name == "nt" else PurePosixPath(value)
+    return not pure.root and not pure.drive
 
 
 def _target_is_indexed(file_path: str, root: "Path") -> bool:
@@ -1047,6 +1074,7 @@ def dispatch_command(cmd: str) -> None:
             depth=2,
             token_budget=budget,
             context_filters=context_filters,
+            graph_path=str(gp),
         )
         querylog.log_query(
             kind="query",
@@ -1112,12 +1140,20 @@ def dispatch_command(cmd: str) -> None:
         except Exception as exc:
             print(f"error: could not load graph: {exc}", file=sys.stderr)
             sys.exit(1)
+        # Derive the analysed repo root from the graph's own location so an
+        # absolute-path seed resolves without requiring cwd to be that root
+        # (#2706). The graph is written to <root>/<GRAPHIFY_OUT_NAME>/graph.json,
+        # so the root is the output dir's parent; a graph pointed at directly by
+        # --graph falls back to its own directory.
+        from graphify.paths import GRAPHIFY_OUT_NAME
+        graph_root = gp.parent.parent if gp.parent.name == GRAPHIFY_OUT_NAME else gp.parent
         print(
             format_affected(
                 graph,
                 query,
                 relations=relations or DEFAULT_AFFECTED_RELATIONS,
                 depth=depth,
+                root=graph_root,
             )
         )
     elif cmd in ("god-nodes", "god_nodes"):
@@ -1795,22 +1831,19 @@ def dispatch_command(cmd: str) -> None:
         stages = _StageTimer(co_timing)
         print("Loading existing graph...")
         # Solution 3 (#1019): don't hard-exit on an oversized graph.json here.
-        # Core outputs (graph.json + GRAPH_REPORT.md) still get written; the
-        # graph.html render below falls back to the community-aggregation view
-        # (node_limit=5000) when over the cap.
+        # Core outputs (graph.json + GRAPH_REPORT.md) still get written. The
+        # visualization policy below uses its own node-count limit.
         from graphify.security import check_graph_file_size_cap as _check_cap
-        _over_cap = False
         try:
             _check_cap(graph_json)
         except ValueError:
-            _over_cap = True
             try:
                 _over_cap_bytes = graph_json.stat().st_size
             except OSError:
                 _over_cap_bytes = -1
             print(
                 f"warning: graph.json exceeds cap ({_over_cap_bytes} bytes); "
-                f"falling back to community-aggregation view (node_limit=5000)",
+                "continuing with best-effort visualization",
                 file=sys.stderr,
             )
         _raw = json.loads(graph_json.read_text(encoding="utf-8"))
@@ -2002,12 +2035,31 @@ def dispatch_command(cmd: str) -> None:
         # Snapshot BEFORE any artifact is replaced: GRAPH_REPORT.md was written
         # first, so the dated folder held the NEW report, not the previous (#2402).
         from graphify.export import backup_if_protected as _backup
+        from graphify.exporters.html import _HTML_STALE_MARKER
         _backup(out)
+        html_stale_marker = out / _HTML_STALE_MARKER
+
+        def _clear_html_stale_marker() -> None:
+            try:
+                html_stale_marker.unlink(missing_ok=True)
+            except OSError as exc:
+                print(
+                    "warning: graph.html stale marker could not be cleared; "
+                    f"regeneration may be retried: {exc}",
+                    file=sys.stderr,
+                )
+
+        stale_marker_preexisted = html_stale_marker.exists()
+        # Mark before graph.json advances. Report/sidecar generation or process
+        # interruption must not leave an older HTML looking current.
+        html_stale_marker.touch()
         # The #479 guard can refuse this write, so it goes before the sidecars —
         # a report and labels describing a clustering graph.json does not contain
         # are worse than no run at all (#2436).
         if not to_json(G, communities, str(out / "graph.json"),
                        community_labels=labels, built_at_commit=_commit):
+            if not stale_marker_preexisted:
+                _clear_html_stale_marker()
             print(
                 "graph.json NOT written: refusing to overwrite (see warning above). "
                 "GRAPH_REPORT.md, .graphify_labels.json and .graphify_analysis.json "
@@ -2056,22 +2108,46 @@ def dispatch_command(cmd: str) -> None:
         if no_viz:
             if html_target.exists():
                 html_target.unlink()
+            _clear_html_stale_marker()
             stages.mark("export"); stages.total()
             print(f"Done - {len(communities)} communities. GRAPH_REPORT.md and graph.json updated (--no-viz; graph.html removed).")
         else:
+            html_written = False
+            skip_reason: str | None = None
             try:
-                # Over-cap fallback (#1019): force the community-aggregation
-                # path so an oversized graph still renders a usable graph.html.
-                _node_limit = 5000 if _over_cap else None
-                to_html(G, communities, str(html_target), community_labels=labels or None,
-                        node_limit=_node_limit)
-                stages.mark("export"); stages.total()
-                print(f"Done - {len(communities)} communities. GRAPH_REPORT.md, graph.json and graph.html updated.")
+                from graphify.exporters.html import _viz_node_limit
+                viz_limit = _viz_node_limit()
+                if viz_limit <= 0:
+                    html_target.unlink(missing_ok=True)
+                    _clear_html_stale_marker()
+                    skip_reason = "GRAPHIFY_VIZ_NODE_LIMIT=0 disables HTML visualization"
+                else:
+                    # Passing the positive visualization limit explicitly selects
+                    # the community meta-graph when the full graph is too large.
+                    html_written = to_html(
+                        G,
+                        communities,
+                        str(html_target),
+                        community_labels=labels or None,
+                        node_limit=viz_limit,
+                    )
+                    if html_written:
+                        _clear_html_stale_marker()
+                    else:
+                        skip_reason = "no useful community aggregation could be generated"
+                        if html_target.exists():
+                            skip_reason += "; existing graph.html left unchanged"
             except ValueError as viz_err:
+                skip_reason = str(viz_err)
                 if html_target.exists():
-                    html_target.unlink()
-                print(f"Skipped graph.html: {viz_err}")
-                stages.mark("export"); stages.total()
+                    skip_reason += "; existing graph.html left unchanged"
+
+            if skip_reason:
+                print(f"Skipped graph.html: {skip_reason}")
+            stages.mark("export"); stages.total()
+            if html_written:
+                print(f"Done - {len(communities)} communities. GRAPH_REPORT.md, graph.json and graph.html updated.")
+            else:
                 print(f"Done - {len(communities)} communities. GRAPH_REPORT.md and graph.json updated.")
 
     elif cmd == "update":
@@ -2813,7 +2889,7 @@ def dispatch_command(cmd: str) -> None:
             print(
                 "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama] "
                 "[--model M] [--mode deep] [--out DIR|--output DIR] [--google-workspace] [--no-cluster] "
-                "[--no-gitignore] [--code-only] "
+                "[--no-gitignore] [--code-only] [--no-dedup] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
                 "[--api-timeout S] [--postgres DSN] [--cargo] [--allow-partial] [--timing]",
                 file=sys.stderr,
@@ -2839,6 +2915,13 @@ def dispatch_command(cmd: str) -> None:
         cli_allow_partial: bool = False
         no_cluster = False
         dedup_llm = False
+        # --no-dedup: skip entity deduplication entirely. On an incremental
+        # merge the fuzzy pass runs over the COMBINED node set (existing graph +
+        # new chunk), so a small diff merged into a large graph can collapse
+        # pre-existing nodes from files the diff never touched. Turning dedup
+        # off also arms build_merge's #479 shrink guard, which is disabled while
+        # dedup is on because fuzzy merging shrinks the graph legitimately (#2881).
+        no_dedup = False
         google_workspace = False
         global_merge = False
         code_only = False
@@ -2907,6 +2990,8 @@ def dispatch_command(cmd: str) -> None:
                 no_cluster = True; i += 1
             elif a == "--dedup-llm":
                 dedup_llm = True; i += 1
+            elif a == "--no-dedup":
+                no_dedup = True; i += 1
             elif a == "--code-only":
                 code_only = True; i += 1
             elif a == "--google-workspace":
@@ -2964,6 +3049,16 @@ def dispatch_command(cmd: str) -> None:
         if not has_path and cli_postgres_dsn is None:
             print("error: must specify a path to scan or a --postgres DSN", file=sys.stderr)
             sys.exit(1)
+
+        if no_dedup and dedup_llm:
+            # --dedup-llm is pass 3 of the dedup pipeline, so with dedup off it
+            # would be a silent no-op that still demands an API key.
+            print(
+                "error: --no-dedup and --dedup-llm are mutually exclusive "
+                "(--dedup-llm is a tiebreaker inside the dedup pass)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
         _VALID_MODES = {"deep"}
         if extract_mode is not None and extract_mode not in _VALID_MODES:
@@ -3870,16 +3965,24 @@ def dispatch_command(cmd: str) -> None:
             for _src in list(excluded_files) + graph_stale_sources:
                 if _src not in _prune_sources:
                     _prune_sources.append(_src)
-            G = _build_merge(
-                [merged],
-                graph_path=existing_graph_path,
-                prune_sources=_prune_sources or None,
-                dedup=True,
-                dedup_llm_backend=dedup_backend,
-                root=target,
-            )
+            try:
+                G = _build_merge(
+                    [merged],
+                    graph_path=existing_graph_path,
+                    prune_sources=_prune_sources or None,
+                    dedup=not no_dedup,
+                    dedup_llm_backend=dedup_backend,
+                    root=target,
+                )
+            except ValueError as exc:
+                # --no-dedup arms build_merge's #479 shrink guard, which refuses
+                # to drop nodes belonging to files this run neither re-extracted
+                # nor pruned. Report the refusal instead of a traceback (#2881):
+                # graph.json on disk is untouched, so the old graph is intact.
+                print(f"[graphify extract] {exc}", file=sys.stderr)
+                sys.exit(1)
         else:
-            G = _build([merged], dedup=True, dedup_llm_backend=dedup_backend, root=target)
+            G = _build([merged], dedup=not no_dedup, dedup_llm_backend=dedup_backend, root=target)
         stages.mark("build")
         if G.number_of_nodes() == 0:
             print(
