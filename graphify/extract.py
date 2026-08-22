@@ -45,7 +45,9 @@ from graphify.extractors.elixir import extract_elixir  # noqa: F401
 from graphify.extractors.fortran import _cpp_preprocess, extract_fortran  # noqa: F401
 from graphify.extractors.go import _GO_PREDECLARED_FUNCS, extract_go  # noqa: F401
 from graphify.extractors.json_config import extract_json  # noqa: F401
-from graphify.extractors.markdown import extract_markdown  # noqa: F401
+from graphify.extractors.commonlisp import extract_commonlisp  # noqa: F401
+from graphify.extractors.markdown import extract_markdown, _MD_LINK_INDEX_CACHE  # noqa: F401
+from graphify.extractors.ocaml import extract_ocaml  # noqa: F401
 from graphify.extractors.pascal_forms import extract_delphi_form, extract_lazarus_form  # noqa: F401
 from graphify.extractors.powershell import extract_powershell, extract_powershell_manifest  # noqa: F401
 from graphify.extractors.razor import extract_razor  # noqa: F401
@@ -785,7 +787,14 @@ _JS_CONFIG = LanguageConfig(
     call_accessor_node_types=frozenset({"member_expression"}),
     call_accessor_field="property",
     call_accessor_object_field="object",
-    function_boundary_types=frozenset({"function_declaration", "generator_function_declaration", "arrow_function", "method_definition"}),
+    # `function_expression` belongs here so UNTRACKED inline/nested expressions
+    # reach walk_calls' existing closure handler, which already names the type
+    # (`_JS_CLOSURE_TYPES`). Without it the gate never opens, so such an
+    # expression's parameters and locals never fold into extra_locals for its
+    # subtree and read as by-name references (#2241 family). A top-level
+    # `const f = function (…) {}` is tracked via its declarator and was already
+    # fine; the inline/nested forms are what this covers.
+    function_boundary_types=frozenset({"function_declaration", "generator_function_declaration", "arrow_function", "method_definition", "function_expression", "generator_function"}),
     import_handler=_import_js,
 )
 
@@ -806,7 +815,8 @@ _TS_CONFIG = LanguageConfig(
     call_accessor_node_types=frozenset({"member_expression"}),
     call_accessor_field="property",
     call_accessor_object_field="object",
-    function_boundary_types=frozenset({"function_declaration", "generator_function_declaration", "arrow_function", "method_definition"}),
+    # `function_expression`: see the note on the JS config above.
+    function_boundary_types=frozenset({"function_declaration", "generator_function_declaration", "arrow_function", "method_definition", "function_expression", "generator_function"}),
     import_handler=_import_js,
 )
 
@@ -1863,9 +1873,197 @@ def extract_c(path: Path) -> dict:
     return _extract_generic(path, _C_CONFIG)
 
 
+# doctest / Catch2 name each test case with a string literal
+# (``TEST_CASE("name")``), which tree-sitter-cpp cannot parse: the construct
+# becomes an ERROR node and the whole test function is dropped from the graph
+# (issue #2594). Recover the test cases with a regex fallback, mirroring the
+# Spock handling of Groovy ``def "feature"()`` above. Scoped to doctest +
+# Catch2, which share this string-named-macro surface.
+#
+# Only the top-level test-declaration macros are recovered as callable nodes.
+# ``SUBCASE`` / ``SECTION`` are *nested* scopes inside a test body and
+# ``TEST_SUITE`` is a grouping wrapper, not a test function — emitting them as
+# file-contained nodes would fabricate wrong-granularity nodes and edges.
+_CPP_STRING_TEST_MACROS = (
+    "TEST_CASE", "TEST_CASE_TEMPLATE", "SCENARIO",
+)
+# The name group consumes C-string escapes (``\"``, ``\\``) so a test whose
+# name embeds an escaped quote is captured whole, not truncated at the escape.
+_CPP_STRING_TEST_RE = re.compile(
+    r'^[ \t]*(?:' + "|".join(_CPP_STRING_TEST_MACROS) + r')\s*\(\s*"((?:[^"\\]|\\.)+)"',
+    re.MULTILINE,
+)
+
+
+def _augment_cpp_string_tests(path: Path, result: dict) -> dict:
+    """Append callable nodes for doctest/Catch2 string-named test cases that
+    tree-sitter-cpp drops as ERROR nodes (issue #2594).
+
+    The generic C++ pass still recovers the surrounding functions and include
+    edges reliably, so this only adds the missing ``TEST_CASE("...")`` nodes and
+    their ``contains`` edge from the file node — it does not rebuild the result.
+
+    Matching is line-anchored raw text, mirroring the Spock fallback above; it is
+    deliberately not comment/preprocessor aware (a ``TEST_CASE`` disabled behind
+    a block comment or ``#if 0`` may still surface as a node, exactly as a
+    commented Spock ``def "feature"()`` would).
+    """
+    try:
+        source = path.read_text(errors="replace")
+    except OSError:
+        return result
+    matches = list(_CPP_STRING_TEST_RE.finditer(source))
+    if not matches:
+        return result
+
+    str_path = str(path)
+    stem = _file_stem(path)
+    file_nid = _make_id(str_path)
+    # A test name that is all punctuation (TEST_CASE("***")) normalizes to empty,
+    # so _make_id(stem, name) collapses onto this bare-stem id — colliding with
+    # the file's namespace and silently swallowing every later such test under
+    # one id (#1899). Detect that collapse and fall back to a line-positional id.
+    stem_collapse_id = _make_id(stem)
+    nodes = result.setdefault("nodes", [])
+    edges = result.setdefault("edges", [])
+    seen_ids = {n.get("id") for n in nodes}
+
+    for m in matches:
+        test_name = m.group(1)
+        line = source.count("\n", 0, m.start()) + 1
+        test_nid = _make_id(stem, test_name)
+        if test_nid == stem_collapse_id:
+            test_nid = _make_id(stem, "test", f"L{line}")
+        if test_nid in seen_ids:
+            continue
+        seen_ids.add(test_nid)
+        # Keep the raw test name as the label (mirroring the Spock fallback,
+        # which labels feature methods with their quoted string name).
+        nodes.append({
+            "id": test_nid,
+            "label": f'"{test_name}"',
+            "file_type": "code",
+            "source_file": str_path,
+            "source_location": f"L{line}",
+        })
+        edges.append({
+            "source": file_nid,
+            "target": test_nid,
+            "relation": "contains",
+            "confidence": "EXTRACTED",
+            "source_file": str_path,
+            "source_location": f"L{line}",
+            "weight": 1.0,
+        })
+    return result
+
+
+# ── C++/CLI normalization (#2876) ────────────────────────────────────────────
+# tree-sitter-cpp implements none of `ref class`, `Type^`, `Type%`, `gcnew` or
+# `[assembly:…]`. The ERROR lands on the type header, which dissolves the whole
+# class body — a 141-method .NET interop wrapper yielded 12 junk symbols. These
+# rewrites map each spelling onto the nearest standard C++ one.
+
+# Only files carrying one of these engage the rewrite, so plain C/C++/CUDA is
+# parsed byte-for-byte as before. `^`/`%` alone are not markers: they are the
+# ordinary XOR and modulo operators.
+_CPP_CLI_MARKER_RE = re.compile(
+    rb"\b(?:ref|value)\s+(?:class|struct)\b"
+    rb"|\binterface\s+class\b"
+    rb"|\bgcnew\b"
+    rb"|\[\s*(?:assembly|module)\s*:"
+)
+
+# `public ref class Foo` / `value struct Bar` / `interface class Baz` → the
+# access specifier goes too: it is not legal at namespace scope, and leaving it
+# behind is what made recovery invent a stray `public` node.
+_CPP_CLI_CLASS_RE = re.compile(
+    rb"(?:\b(?:public|private|protected)\s+)?\b(?:ref|value)\s+(?=(?:class|struct)\b)"
+    rb"|(?:\b(?:public|private|protected)\s+)?\binterface\s+(?=class\b)"
+)
+# Handle (`String^ s`) and tracking-reference (`int% n`) suffixes.
+#
+# `^` and `%` are also XOR and modulo, and `String^ s` is lexically identical to
+# `a^ b` — attachment to the preceding token does not separate them, because
+# `a% b` and `hash^ mask` are attached too. Rewriting on attachment alone
+# corrupted those into `a  b` / `hash  mask`. So the rewrite is restricted to
+# the two positions where an operator reading is impossible or implausible.
+#
+# 1. Followed by a token that cannot begin an operand: `f(String^, int)`,
+#    `List<String^>`, `(String^)x`, `Object^;`. `a^,` is not valid C++, so
+#    there is no arithmetic to lose here. `*` and `&` are deliberately NOT in
+#    the set — `a^*p` and `a^&b` are valid XOR expressions, and `String^*` is
+#    rare enough not to be worth trading for them.
+_CPP_CLI_SUFFIX_UNAMBIGUOUS_RE = re.compile(rb"(?<=[A-Za-z0-9_>])[\^%](?=\s*[,)\]>;])")
+# 2. A type-shaped left side followed by a declarator: `System::String^ s`,
+#    `List<int>^ items`, `DataTable^ t`, `int% n`. Qualified names, a closing
+#    generic bracket, .NET's PascalCase convention and the primitive value
+#    types are all type positions; requiring one keeps lowercase operands like
+#    `count% 2` and `hash^ mask` as arithmetic. A capitalized name must also
+#    carry a lowercase letter, so SCREAMING_CASE constants stay arithmetic
+#    too (`MASK^ value`); a lone capital is exempt for generic parameters
+#    (`T^ x`). The type is captured and re-emitted so the substitution stays
+#    byte-length preserving.
+_CPP_CLI_SUFFIX_DECL_RE = re.compile(
+    rb"(\b[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+"   # System::String
+    rb"|\b[A-Z][A-Za-z0-9_]*[a-z][A-Za-z0-9_]*"                   # String, DataTable
+    rb"|\b[A-Z](?=[\^%])"                                        # T
+    rb"|\b(?:bool|char|wchar_t|short|int|long|float|double|unsigned|signed)"
+    rb"|>)"                                                      # List<int>^
+    rb"[\^%](?=\s+[A-Za-z_])"
+)
+# `[assembly:AssemblyVersion("1.0")]` and friends.
+_CPP_CLI_ATTR_RE = re.compile(rb"\[\s*(?:assembly|module)\s*:[^\[\]]*\]", re.S)
+
+
+def _blank_keeping_newlines(m: "re.Match[bytes]") -> bytes:
+    """Replace a match with spaces, but keep its line breaks.
+
+    Byte length alone is not enough. Both the class-header and the attribute
+    pattern can span lines — ``[assembly:AssemblyVersion(\\n  "1.0"\\n)]`` is
+    ordinary formatting — and blanking a newline merges two source lines, which
+    shifts the reported line number of every symbol below it. Preserving CR and
+    LF in place keeps line and column stable as well as offset.
+    """
+    return re.sub(rb"[^\r\n]", b" ", m.group(0))
+
+
+def _normalize_cpp_cli(source: bytes) -> bytes | None:
+    """Rewrite C++/CLI spellings to standard C++ ones, or None if not C++/CLI.
+
+    The rewrite is **byte-length preserving** — dropped tokens are overwritten
+    with spaces, never deleted, and ``gcnew`` becomes ``new`` plus padding — and
+    line breaks inside a removed token are kept, so every offset, line and
+    column still points at the same place in the file on disk and reported
+    source locations stay accurate (#2876).
+    """
+    if not _CPP_CLI_MARKER_RE.search(source):
+        return None
+    out = _CPP_CLI_CLASS_RE.sub(_blank_keeping_newlines, source)
+    out = re.sub(rb"\bgcnew\b", b"new  ", out)
+    out = _CPP_CLI_SUFFIX_UNAMBIGUOUS_RE.sub(b" ", out)
+    out = _CPP_CLI_SUFFIX_DECL_RE.sub(rb"\1 ", out)
+    return _CPP_CLI_ATTR_RE.sub(_blank_keeping_newlines, out)
+
+
 def extract_cpp(path: Path) -> dict:
-    """Extract functions, classes, and includes from a .cpp/.cc/.cxx/.hpp file."""
-    return _extract_generic(path, _CPP_CONFIG)
+    """Extract functions, classes, and includes from a .cpp/.cc/.cxx/.hpp file.
+
+    C++/CLI sources are normalized to standard C++ first (#2876); see
+    :func:`_normalize_cpp_cli`.
+
+    Recovers doctest/Catch2 ``TEST_CASE("name")`` test cases that tree-sitter-cpp
+    drops as ERROR nodes (issue #2594), mirroring the Spock fallback for Groovy.
+    """
+    try:
+        source = path.read_bytes()
+    except OSError:
+        # Let _extract_generic report the read failure in its usual shape.
+        return _augment_cpp_string_tests(path, _extract_generic(path, _CPP_CONFIG))
+    result = _extract_generic(
+        path, _CPP_CONFIG, source_override=_normalize_cpp_cli(source) or source
+    )
+    return _augment_cpp_string_tests(path, result)
 
 
 def extract_ruby(path: Path) -> dict:
@@ -2289,9 +2487,6 @@ def _merge_csharp_partial_class_nodes(
     per_file: list[dict],
     all_nodes: list[dict],
     all_edges: list[dict],
-) -> None:
-    """Collapse C# `partial class Foo` halves split across files into ONE node
-    (#2332).
     paths: list[Path],
     root: Path,
 ) -> None:
@@ -2302,13 +2497,6 @@ def _merge_csharp_partial_class_nodes(
     declaring `partial class Foo` produces its own `Foo` node: members split
     across the halves and cross-half calls don't resolve (two candidate types
     make every receiver-typed lookup bail as ambiguous). Group partial-stamped
-    type nodes by (namespace, label) — same-named types in different namespaces
-    are distinct types, non-partial same-named types are separate declarations,
-    and nested partials are excluded (their ids omit the enclosing type, so a
-    same-named nested pair under different outers would falsely merge). The
-    canonical node is the sorted-first half by (source_file, source_location,
-    id); every edge endpoint and raw-call caller is remapped onto it. Member
-    node ids are left untouched — only the class-level nodes collapse.
     type nodes by (assembly, namespace, label) — same-named types in different
     namespaces are distinct types, non-partial same-named types are separate
     declarations, and nested partials are excluded (their ids omit the
@@ -2412,15 +2600,6 @@ def _merge_csharp_partial_class_nodes(
     for members in groups.values():
         if len(members) < 2:
             continue
-        members.sort(key=lambda n: (
-            str(n.get("source_file", "")),
-            str(n.get("source_location", "")),
-            str(n.get("id", "")),
-        ))
-        canonical_nid = members[0]["id"]
-        for other in members[1:]:
-            if other["id"] != canonical_nid:
-                remap[other["id"]] = canonical_nid
         by_assembly: dict[str, list[dict]] = {}
         for n in members:
             by_assembly.setdefault(_assembly_of_node(n["id"]), []).append(n)
@@ -4842,6 +5021,12 @@ _DISPATCH: dict[str, Any] = {
     ".svelte": extract_svelte,
     ".astro": extract_astro,
     ".dart": extract_dart,
+    ".ml": extract_ocaml,
+    ".mli": extract_ocaml,
+    ".lisp": extract_commonlisp,
+    ".cl": extract_commonlisp,
+    ".lsp": extract_commonlisp,
+    ".asd": extract_commonlisp,
     ".v": extract_verilog,
     ".sv": extract_verilog,
     ".svh": extract_verilog,
@@ -4894,6 +5079,12 @@ _EXTRA_FOR_EXTENSION = {
     ".hcl": "terraform",
     ".dm": "dm",
     ".dme": "dm",
+    ".ml": "ocaml",
+    ".mli": "ocaml",
+    ".lisp": "commonlisp",
+    ".cl": "commonlisp",
+    ".lsp": "commonlisp",
+    ".asd": "commonlisp",
 }
 
 # Substrings an extractor's error carries to classify why a dependency-backed
@@ -5333,6 +5524,7 @@ def extract(
     # Workspace package manifests/globs can change during watch or repeated extraction.
     _WORKSPACE_PACKAGE_CACHE.clear()
     _XAML_CSHARP_CLASS_CACHE.clear()
+    _MD_LINK_INDEX_CACHE.clear()
 
     # Infer a common root for cache keys (use first diverging segment, not sum of all matches)
     try:
@@ -5419,7 +5611,7 @@ def extract(
     _empty_sources: list[str] = []
     for i, _p in enumerate(paths):
         _res = per_file[i] or {}
-        if _res.get("nodes") or _res.get("error"):
+        if _res.get("nodes") or _res.get("error") or _res.get("skipped"):
             continue
         if _get_extractor(_p) is not None:
             _empty_sources.append(str(_p))
@@ -5450,6 +5642,12 @@ def extract(
             if _key not in _failed_seen:
                 _failed_sources.append(_key)
                 _failed_seen.add(_key)
+            continue
+        if _res.get("skipped"):
+            # The extractor declined this file by design (data JSON, #1224), so
+            # zero nodes is the intended outcome rather than a failure. Marking
+            # it failed keeps it out of the incremental manifest and re-queues
+            # it on every subsequent run, forever (#2879).
             continue
         if (not _res.get("nodes")) and _get_extractor(_p) is not None:
             if _key not in _failed_seen:
@@ -5537,19 +5735,36 @@ def extract(
         # results, so those fall back to the file-node-only arm.
         if len(_res.get("nodes", [])) <= 1 or _pe.get("multiline_error"):
             _rel = os.path.relpath(str(_p), str(root)).replace("\\", "/")
-            _syntax_error_files.append((_rel, _pe.get("first_error_line")))
+            # Symbols recovered from the file, excluding its own file node. This
+            # is what separates the two cases the warning otherwise blurs: a file
+            # that contributed nothing but its file node is a total loss, while
+            # one that yielded most of its symbols and lost an ERROR region is
+            # partial. "May be partially extracted" rendered both identically.
+            _kept = max(len(_res.get("nodes", [])) - 1, 0)
+            _syntax_error_files.append((_rel, _pe.get("first_error_line"), _kept))
     if _syntax_error_files:
+        def _describe_syntax_error(rel: str, line: "int | None", kept: int) -> str:
+            _where = f"first error at line {line}" if line else "syntax error"
+            _got = "no symbols extracted" if kept == 0 else f"{kept} symbol(s) extracted"
+            return f"{rel} ({_where}, {_got})"
+
         _shown = ", ".join(
-            f"{x} (first error at line {ln})" if ln else x
-            for x, ln in _syntax_error_files[:5]
+            _describe_syntax_error(*f) for f in _syntax_error_files[:5]
         )
         _more = (
             f" (+{len(_syntax_error_files) - 5} more)"
             if len(_syntax_error_files) > 5 else ""
         )
+        # No issue reference here. This message used to end in "(#2551)" for
+        # EVERY language, and #2551 is closed and Kotlin-specific ("bundled
+        # grammar rejects one-line type bodies"). It was the only lead the
+        # message offered, so a reader following it landed on a resolved problem
+        # in another language and concluded their own was already tracked
+        # (#2788). The file, the line and the symbol count are the actionable
+        # part; a single hardcoded number cannot be right for every grammar.
         print(
             f"  warning: {len(_syntax_error_files)} file(s) had syntax errors and "
-            f"may be partially extracted: {_shown}{_more} (#2551)",
+            f"may be partially extracted: {_shown}{_more}",
             file=sys.stderr, flush=True,
         )
 
@@ -5983,7 +6198,6 @@ def extract(
     # graph is identical regardless of scan root (#2072).
     _repoint_python_package_imports(paths, all_nodes, all_edges, root)
     _merge_swift_extensions(per_file, all_nodes, all_edges)
-    _merge_csharp_partial_class_nodes(per_file, all_nodes, all_edges)
     _merge_csharp_partial_class_nodes(per_file, all_nodes, all_edges, paths, root)
     _disambiguate_colliding_node_ids(all_nodes, all_edges, all_raw_calls, root)
     _canonicalize_csharp_namespace_nodes(all_nodes, all_edges)
@@ -6402,7 +6616,11 @@ def extract(
                     "relation": "indirect_call",
                     "context": rc.get("context", "argument"),
                     "confidence": "INFERRED",
-                    "confidence_score": 0.8,
+                    # 0.85, not 0.8: the rubric in references/extraction-spec.md
+                    # is a discrete set {0.55, 0.65, 0.75, 0.85, 0.95} and 0.8 is
+                    # not in it. Same tier, same meaning ("strong inference"),
+                    # now a value the documented scale actually contains (#2813).
+                    "confidence_score": 0.85,
                     "source_file": rc.get("source_file", ""),
                     "source_location": rc.get("source_location"),
                     "weight": 1.0,
@@ -6431,7 +6649,9 @@ def extract(
                 confidence_score = 1.0
             else:
                 confidence = "INFERRED"
-                confidence_score = 0.8
+                # 0.85 rather than 0.8 — the rubric's INFERRED set is discrete
+                # and does not contain 0.8 (#2813).
+                confidence_score = 0.85
             all_edges.append({
                 "source": caller,
                 "target": tgt,

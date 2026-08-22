@@ -1,4 +1,5 @@
 import os
+import subprocess
 import unicodedata
 import pytest
 from pathlib import Path
@@ -6,6 +7,14 @@ from graphify.detect import classify_file, count_words, detect, detect_increment
 from graphify import detect as detect_mod
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+    )
 
 
 def as_posix_list(paths) -> list[str]:
@@ -162,7 +171,7 @@ def test_graphifyignore_matches_nfd_path_with_nfc_pattern(tmp_path):
     nfd_name = unicodedata.normalize("NFD", nfc_name)
     assert nfc_name != nfd_name  # guard: the two forms really do differ
 
-    (tmp_path / ".graphifyignore").write_text(f"{nfc_name}/\n")
+    (tmp_path / ".graphifyignore").write_text(f"{nfc_name}/\n", encoding="utf-8")
     secret_dir = tmp_path / nfd_name
     secret_dir.mkdir()
     (secret_dir / "contrato.py").write_text("x = 1")
@@ -179,7 +188,7 @@ def test_graphifyignore_matches_nfc_path_with_nfd_pattern(tmp_path):
     nfc_name = unicodedata.normalize("NFC", "Or\u00e7amento")
     nfd_name = unicodedata.normalize("NFD", nfc_name)
 
-    (tmp_path / ".graphifyignore").write_text(f"{nfd_name}/\n")
+    (tmp_path / ".graphifyignore").write_text(f"{nfd_name}/\n", encoding="utf-8")
     d = tmp_path / nfc_name
     d.mkdir()
     (d / "contrato.py").write_text("x = 1")
@@ -426,6 +435,137 @@ def test_gitignore_nested_below_root_excludes_file(tmp_path):
     assert not any("root.log" in f for f in code_files)
     assert not any("secret.txt" in f for f in code_files)
     assert result["graphifyignore_patterns"] == 2
+
+
+def test_gitignore_keeps_tracked_file_but_drops_untracked_sibling(tmp_path):
+    """Gitignore rules do not apply to tracked files, matching Git itself (#2759)."""
+    _git(tmp_path, "init", "-q")
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    tracked = storage / "fileWatcher.js"
+    tracked.write_text("export function watch(){ return 1; }", encoding="utf-8")
+    app = tmp_path / "app.js"
+    app.write_text("export function ok(){ return 2; }", encoding="utf-8")
+    _git(tmp_path, "add", "storage/fileWatcher.js", "app.js")
+
+    (tmp_path / ".gitignore").write_text("storage/\n", encoding="utf-8")
+    untracked = storage / "scratch.js"
+    untracked.write_text("export function scratch(){ return 3; }", encoding="utf-8")
+
+    result = detect(tmp_path)
+    code = {Path(path).name for path in result["files"]["code"]}
+
+    assert code == {"app.js", "fileWatcher.js"}
+    assert str(untracked) in result["ignored"]
+    assert str(tracked) not in result["ignored"]
+
+
+def test_graphifyignore_still_excludes_git_tracked_file(tmp_path):
+    """A graph-specific exclusion remains authoritative for tracked paths."""
+    _git(tmp_path, "init", "-q")
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    tracked = storage / "fileWatcher.js"
+    tracked.write_text("export function watch(){ return 1; }", encoding="utf-8")
+    _git(tmp_path, "add", "storage/fileWatcher.js")
+    (tmp_path / ".graphifyignore").write_text("storage/\n", encoding="utf-8")
+
+    result = detect(tmp_path)
+
+    assert str(tracked) not in result["files"]["code"]
+    assert any(entry.rstrip(os.sep) == str(storage) for entry in result["ignored"])
+
+
+def test_tracked_gitignore_exemption_works_for_subdirectory_scan(tmp_path):
+    """Tracked paths are repo-relative even when the requested scan root is nested."""
+    _git(tmp_path, "init", "-q")
+    project = tmp_path / "packages" / "app"
+    storage = project / "storage"
+    storage.mkdir(parents=True)
+    tracked = storage / "fileWatcher.js"
+    tracked.write_text("export function watch(){ return 1; }", encoding="utf-8")
+    _git(tmp_path, "add", "packages/app/storage/fileWatcher.js")
+    (tmp_path / ".gitignore").write_text("storage/\n", encoding="utf-8")
+
+    result = detect(project)
+
+    assert str(tracked) in result["files"]["code"]
+
+
+def test_ignored_predicate_keeps_git_tracked_ignored_file(tmp_path):
+    """Watch reconciliation must agree with detect() for tracked paths (#2759)."""
+    _git(tmp_path, "init", "-q")
+    tracked = tmp_path / "tracked.py"
+    tracked.write_text("value = 1\n", encoding="utf-8")
+    _git(tmp_path, "add", "tracked.py")
+    (tmp_path / ".gitignore").write_text("tracked.py\n", encoding="utf-8")
+
+    ignored = detect_mod.ignored_predicate(tmp_path, gitignore=True)
+
+    assert ignored(tracked) is False
+
+
+def test_extra_exclude_still_excludes_git_tracked_file(tmp_path):
+    """CLI/persisted excludes are graph-level intent, not Git ignore rules."""
+    _git(tmp_path, "init", "-q")
+    tracked = tmp_path / "tracked.py"
+    tracked.write_text("value = 1\n", encoding="utf-8")
+    _git(tmp_path, "add", "tracked.py")
+
+    result = detect(tmp_path, extra_excludes=["tracked.py"])
+
+    assert str(tracked) not in result["files"]["code"]
+    assert str(tracked) in result["ignored"]
+
+
+def test_git_tracking_probe_failure_preserves_ignore_behavior(
+    tmp_path, monkeypatch
+):
+    """A missing/broken Git command must not fail open or abort discovery."""
+    _git(tmp_path, "init", "-q")
+    ignored_file = tmp_path / "ignored.py"
+    ignored_file.write_text("value = 1\n", encoding="utf-8")
+    _git(tmp_path, "add", "ignored.py")
+    (tmp_path / ".gitignore").write_text("ignored.py\n", encoding="utf-8")
+
+    def _git_unavailable(*args, **kwargs):
+        raise OSError("git unavailable")
+
+    monkeypatch.setattr(detect_mod.subprocess, "run", _git_unavailable)
+
+    result = detect(tmp_path)
+
+    assert str(ignored_file) not in result["files"]["code"]
+    assert str(ignored_file) in result["ignored"]
+
+
+def test_git_lsfiles_skipped_when_no_gitignore_contributes(tmp_path, monkeypatch):
+    """Optimization (#2759): a git repo with no .gitignore in play must not pay
+    the `git ls-files` subprocess — nothing can be gitignore-dropped, so the
+    tracked-exemption is moot. A .gitignore that DOES contribute still probes."""
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    _git(tmp_path, "add", "app.py")
+
+    real_run = detect_mod.subprocess.run
+    calls = {"ls_files": 0}
+
+    def _spy(args, *a, **k):
+        if isinstance(args, list) and "ls-files" in args:
+            calls["ls_files"] += 1
+        return real_run(args, *a, **k)
+
+    monkeypatch.setattr(detect_mod.subprocess, "run", _spy)
+
+    # No .gitignore anywhere -> gitignore contributes nothing -> no probe.
+    detect(tmp_path)
+    assert calls["ls_files"] == 0, "git ls-files ran despite no .gitignore in play"
+
+    # Add a .gitignore -> gitignore now contributes -> probe happens (once).
+    (tmp_path / ".gitignore").write_text("build/\n", encoding="utf-8")
+    calls["ls_files"] = 0
+    detect(tmp_path)
+    assert calls["ls_files"] >= 1, "git ls-files skipped even though .gitignore is present"
 
 
 def test_gitignore_nested_below_root_prunes_whole_directory(tmp_path):
@@ -2417,6 +2557,49 @@ def test_convert_office_file_outside_root_falls_back(tmp_path, monkeypatch):
     assert out1 is not None and out1.name == out2.name
 
 
+def test_detect_office_conversion_respects_cache_root(tmp_path, monkeypatch):
+    """#2787: detect() with cache_root must write converted sidecars under
+    cache_root/GRAPHIFY_OUT/converted, leaving the scanned corpus untouched, while
+    keeping the sidecar filename hash anchored to the scan root."""
+    monkeypatch.setattr(detect_mod, "docx_to_markdown", lambda p: "# Spec\nConverted specification text.")
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir(parents=True)
+    cache_out = tmp_path / "cache_out"
+    cache_out.mkdir(parents=True)
+
+    doc_path = corpus / "spec.docx"
+    doc_path.write_bytes(b"placeholder")
+
+    result = detect(corpus, cache_root=cache_out)
+
+    # 1. Scanned corpus tree must not be mutated
+    assert not (corpus / detect_mod.GRAPHIFY_OUT).exists(), (
+        "detect() must not write graphify-out into the scanned corpus tree when cache_root is provided (#2787)"
+    )
+
+    # 2. Converted sidecar must exist under cache_root
+    converted_dir = cache_out / detect_mod.GRAPHIFY_OUT / "converted"
+    assert converted_dir.is_dir(), "converted directory must be created under cache_root"
+
+    # 3. Detection result must point to the redirected sidecar
+    doc_files = result["files"]["document"]
+    assert len(doc_files) == 1
+    sidecar_path = Path(doc_files[0])
+    assert sidecar_path.is_file()
+    assert sidecar_path.parent.resolve() == converted_dir.resolve()
+
+    # 4. Content must match expected conversion
+    content = sidecar_path.read_text(encoding="utf-8")
+    assert "<!-- converted from spec.docx -->" in content
+    assert "# Spec" in content
+
+    # 5. Sidecar filename must remain anchored to the corpus scan root
+    import hashlib
+    expected_hash = hashlib.sha256(unicodedata.normalize("NFC", "spec.docx").encode()).hexdigest()[:8]
+    assert sidecar_path.name == f"spec_{expected_hash}.md"
+
+
 def test_detect_keeps_env_source_dirs(tmp_path):
     """#2058: a real source directory named env/ or *_env/ with no virtualenv
     markers must be indexed, not silently pruned as a false-positive venv."""
@@ -2847,6 +3030,106 @@ def test_detect_incremental_exclusion_stable_across_runs(tmp_path):
     inc2 = detect_incremental(tmp_path, manifest_path, extra_excludes=["b.py"])
     assert inc2["deleted_files"] == []
     assert inc2["excluded_files"] == []
+
+
+# ── #2838: manifest seen timestamps preserved for unchanged entries ──
+
+def test_save_manifest_unchanged_file_preserves_seen(tmp_path):
+    """#2838: save_manifest preserves existing seen timestamp for unchanged entries."""
+    import json
+    a = tmp_path / "a.py"
+    a.write_text("x = 1\n", encoding="utf-8")
+    manifest_path = str(tmp_path / "graphify-out" / "manifest.json")
+
+    save_manifest({"code": [str(a)]}, manifest_path, root=tmp_path)
+    raw1 = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    seen_1 = raw1["a.py"]["seen"]
+    assert isinstance(seen_1, (int, float))
+
+    # Second save on unchanged file must keep identical seen value
+    save_manifest({"code": [str(a)]}, manifest_path, root=tmp_path)
+    raw2 = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    assert raw2["a.py"]["seen"] == seen_1
+    assert raw2["a.py"]["ast_hash"] == raw1["a.py"]["ast_hash"]
+    assert raw2["a.py"]["mtime"] == raw1["a.py"]["mtime"]
+
+
+def test_save_manifest_changed_file_updates_seen(tmp_path):
+    """#2838: save_manifest assigns a new seen timestamp when file content changes."""
+    import json
+    import time
+    a = tmp_path / "a.py"
+    a.write_text("x = 1\n", encoding="utf-8")
+    manifest_path = str(tmp_path / "graphify-out" / "manifest.json")
+
+    save_manifest({"code": [str(a)]}, manifest_path, root=tmp_path)
+    raw1 = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    seen_1 = raw1["a.py"]["seen"]
+
+    # Modify file content (new hash)
+    time.sleep(0.01)
+    a.write_text("x = 2\n", encoding="utf-8")
+    save_manifest({"code": [str(a)]}, manifest_path, root=tmp_path)
+    raw2 = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+
+    assert raw2["a.py"]["seen"] >= seen_1
+    assert raw2["a.py"]["ast_hash"] != raw1["a.py"]["ast_hash"]
+
+
+def test_save_manifest_noop_skips_disk_write(tmp_path):
+    """#2838: save_manifest does not rewrite manifest.json when payload is identical."""
+    a = tmp_path / "a.py"
+    a.write_text("x = 1\n", encoding="utf-8")
+    manifest_path = Path(tmp_path / "graphify-out" / "manifest.json")
+
+    save_manifest({"code": [str(a)]}, str(manifest_path), root=tmp_path)
+    mtime_1 = manifest_path.stat().st_mtime_ns
+    bytes_1 = manifest_path.read_bytes()
+
+    save_manifest({"code": [str(a)]}, str(manifest_path), root=tmp_path)
+    mtime_2 = manifest_path.stat().st_mtime_ns
+    bytes_2 = manifest_path.read_bytes()
+
+    assert bytes_1 == bytes_2
+    assert mtime_1 == mtime_2
+
+
+def test_save_manifest_ast_kind_noop_then_change(tmp_path):
+    """#2838's literal path: `graphify update` calls save_manifest with kind='ast'.
+    A no-op re-run must leave the manifest byte-identical; a real edit must update it."""
+    import json
+    a = tmp_path / "a.py"
+    a.write_text("x = 1\n", encoding="utf-8")
+    manifest_path = Path(tmp_path / "graphify-out" / "manifest.json")
+
+    save_manifest({"code": [str(a)]}, str(manifest_path), root=tmp_path, kind="ast")
+    bytes_1 = manifest_path.read_bytes()
+    seen_1 = json.loads(bytes_1)["a.py"]["seen"]
+
+    save_manifest({"code": [str(a)]}, str(manifest_path), root=tmp_path, kind="ast")  # no-op
+    assert manifest_path.read_bytes() == bytes_1, "ast-kind no-op re-run churned the manifest"
+
+    import time as _t; _t.sleep(0.01)
+    a.write_text("x = 2\n", encoding="utf-8")
+    save_manifest({"code": [str(a)]}, str(manifest_path), root=tmp_path, kind="ast")
+    raw2 = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert raw2["a.py"]["ast_hash"] != json.loads(bytes_1)["a.py"]["ast_hash"]
+    assert raw2["a.py"]["seen"] >= seen_1
+
+
+def test_save_manifest_corrupt_existing_manifest_still_writes(tmp_path):
+    """The byte-equality skip must never turn an unparseable on-disk manifest into
+    a silent no-write — a real update has to persist over corruption."""
+    import json
+    a = tmp_path / "a.py"
+    a.write_text("x = 1\n", encoding="utf-8")
+    manifest_path = Path(tmp_path / "graphify-out" / "manifest.json")
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text("{ this is not valid json", encoding="utf-8")
+
+    save_manifest({"code": [str(a)]}, str(manifest_path), root=tmp_path)
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))  # must parse now
+    assert "a.py" in raw and isinstance(raw["a.py"]["seen"], (int, float))
 
 
 # ── #2106: sensitive-filter over-match (prose/source rescued, real secrets kept) ──
