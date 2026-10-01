@@ -182,6 +182,30 @@ def test_read_nudges_source_outside_custom_output_dir(tmp_path, monkeypatch):
     assert "graphify query" in out
 
 
+def test_read_ancestry_check_with_nested_output_and_matching_basenames(tmp_path, monkeypatch):
+    # Bug #3959: GRAPHIFY_OUT=artifacts/graphify
+    out_name = "artifacts/graphify"
+    # artifacts/graphify/GRAPH_REPORT.md -> inside output, no nudge
+    out1 = _invoke("read", {"tool_input": {"file_path": "artifacts/graphify/GRAPH_REPORT.md"}},
+                   tmp_path, monkeypatch, graph=True, out_name=out_name)
+    assert out1.strip() == ""
+
+    # tools/graphify/notes.md -> outside output, should nudge
+    out2 = _invoke("read", {"tool_input": {"file_path": "tools/graphify/notes.md"}},
+                   tmp_path, monkeypatch, graph=True, out_name=out_name)
+    assert "graphify query" in out2
+
+    # .codex/skills/graphify/SKILL.md -> outside output, should nudge
+    out3 = _invoke("read", {"tool_input": {"file_path": ".codex/skills/graphify/SKILL.md"}},
+                   tmp_path, monkeypatch, graph=True, out_name=out_name)
+    assert "graphify query" in out3
+
+    # src/app.py -> outside output, should nudge
+    out4 = _invoke("read", {"tool_input": {"file_path": "src/app.py"}},
+                   tmp_path, monkeypatch, graph=True, out_name=out_name)
+    assert "graphify query" in out4
+
+
 # --------------------------------------------------------------------------- #
 # fail-open: malformed / empty stdin never crashes or blocks
 # --------------------------------------------------------------------------- #

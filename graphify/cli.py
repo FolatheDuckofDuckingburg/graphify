@@ -870,16 +870,12 @@ def _run_hook_guard(kind: str, strict: bool = False) -> None:
                 sys.stdout.write(_SEARCH_NUDGE)
         elif kind == "read":
             vals = [str(t.get("file_path") or ""), str(t.get("pattern") or ""), str(t.get("path") or "")]
-            j = " ".join(vals).lower().replace("\\", "/")
             tails = [
                 "." + seg.rsplit(".", 1)[-1]
                 for v in vals if v
                 for seg in [v.lower().replace("\\", "/").rsplit("/", 1)[-1]]
                 if "." in seg
             ]
-            under_out = "graphify-out/" in j or (GRAPHIFY_OUT_NAME.lower() + "/") in j
-            if under_out or not any(tl in _HOOK_SOURCE_EXTS for tl in tails):
-                return
             # #1840 (a): skip files outside the graph's project. cwd (or
             # CLAUDE_PROJECT_DIR, which Claude Code sets) is the project root, since
             # the guard only triggers when graph.json exists relative to cwd. A path
@@ -889,6 +885,30 @@ def _run_hook_guard(kind: str, strict: bool = False) -> None:
                 root = root.resolve()
             except (OSError, RuntimeError):
                 pass
+            out_p = out_path()
+            if not out_p.is_absolute():
+                out_p = root / out_p
+            try:
+                out_dir = out_p.resolve()
+            except (OSError, RuntimeError):
+                out_dir = out_p
+
+            def _is_under_out(target_path_str: str) -> bool:
+                if not target_path_str:
+                    return False
+                try:
+                    tp = Path(target_path_str)
+                    if not tp.is_absolute():
+                        tp = root / tp
+                    tp = tp.resolve()
+                    tp.relative_to(out_dir)
+                    return True
+                except (ValueError, OSError, RuntimeError):
+                    return False
+
+            under_out = any(_is_under_out(v) for v in vals if v)
+            if under_out or not any(tl in _HOOK_SOURCE_EXTS for tl in tails):
+                return
             path_vals = [str(t.get("file_path") or ""), str(t.get("path") or "")]
             explicit = [v for v in path_vals if v]
             if explicit:
