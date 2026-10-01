@@ -17,7 +17,6 @@ from graphify.security import sanitize_label
 from graphify.analyze import _node_community_map
 from graphify.build import edge_data
 from graphify.paths import stem_filename_budget
-from graphify.paths import stem_filename_budget, write_json_atomic, write_text_atomic
 
 from graphify.exporters.graphdb import push_to_falkordb, push_to_neo4j  # noqa: E402,F401
 
@@ -727,7 +726,7 @@ def to_obsidian(
             _skipped.append(rel_name)
             return False
         target.parent.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(target, content)
+        target.write_text(content, encoding="utf-8")  # nosec
         _written.append(rel_name)
         return True
 
@@ -1200,7 +1199,7 @@ def to_canvas(
         })
 
     canvas_data = {"nodes": canvas_nodes, "edges": canvas_edges}
-    write_json_atomic(output_path, canvas_data, indent=2)
+    Path(output_path).write_text(json.dumps(canvas_data, indent=2), encoding="utf-8")  # nosec
 
 
 def to_graphml(

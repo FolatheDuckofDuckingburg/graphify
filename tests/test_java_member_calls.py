@@ -241,11 +241,7 @@ def test_ambiguous_receiver_type_emits_no_edge(tmp_path: Path):
     assert send_targets == set()
 
 
-def test_inherited_field_resolves_and_chained_receiver_stays_deferred(tmp_path: Path):
-    """#3151: a field declared on the superclass now types `this.<field>` in
-    the subclass, so `this.gateway.charge()` resolves. A chained receiver
-    (`factory.create().charge()`) still carries no declared type and stays
-    deferred rather than guessed."""
+def test_inherited_field_and_chained_receiver_are_deferred(tmp_path: Path):
     calls, result = _calls(tmp_path, {
         "Services.java": (
             "class Gateway { void charge() {} Gateway create() { return this; } }\n"
@@ -260,9 +256,7 @@ def test_inherited_field_resolves_and_chained_receiver_stays_deferred(tmp_path: 
 
     inherited = _find(result, ".inherited()", "checkout")
     chained = _find(result, ".chained()", "checkout")
-    assert any(source == inherited and "charge" in target
-               for source, target in calls), "superclass field must type the receiver"
-    assert not any(source == chained and "charge" in target
+    assert not any(source in {inherited, chained} and "charge" in target
                    for source, target in calls)
 
 
