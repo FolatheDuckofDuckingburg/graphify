@@ -422,3 +422,4 @@ def test_affected_absolute_seed_with_graph_not_under_out_dir(tmp_path, monkeypat
     out = capsys.readouterr().out
     assert "Affected nodes for Foo" in out
     assert "X()" in out
+
