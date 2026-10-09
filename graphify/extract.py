@@ -2312,8 +2312,16 @@ _LANGUAGE_BUILTIN_BASE_CLASSES_CI: dict[str, frozenset[str]] = {
 }
 
 
-def _node_label_key(node: dict, fold: bool = False) -> str:
+def _bare_label(label: str) -> str:
+    """Extract the bare symbol name (last segment) from a qualified label."""
+    parts = re.split(r"[\.\:\/]+", label)
+    return parts[-1] if parts else label
+
+
+def _node_label_key(node: dict, fold: bool = False, bare: bool = False) -> str:
     label = str(node.get("label", "")).strip()
+    if bare:
+        label = _bare_label(label)
     key = re.sub(r"[^a-zA-Z0-9]+", "", label)
     return key.lower() if fold else key
 
@@ -2336,13 +2344,17 @@ def _is_top_level_function_definition(node: dict) -> bool:
 
 def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
     """Map unresolved no-source stubs to a unique real definition with the same label."""
-    real_by_label: dict[str, list[dict]] = {}       # exact-case type-like (all languages)
-    real_by_label_ci: dict[str, list[dict]] = {}    # case-INSENSITIVE-language reals only
-    func_by_label: dict[str, list[dict]] = {}       # top-level function defs (#1781)
+    real_by_label: dict[str, list[dict]] = {}       # exact-case full key (all languages)
+    real_by_bare_label: dict[str, list[dict]] = {}  # exact-case bare key (all languages)
+    real_by_label_ci: dict[str, list[dict]] = {}    # case-INSENSITIVE full key
+    real_by_bare_label_ci: dict[str, list[dict]] = {} # case-INSENSITIVE bare key
+    func_by_label: dict[str, list[dict]] = {}       # top-level function defs full key (#1781)
+    func_by_bare_label: dict[str, list[dict]] = {}  # top-level function defs bare key
     stubs: list[dict] = []
 
     for node in nodes:
         key = _node_label_key(node)
+        bare_key = _node_label_key(node, bare=True)
         if not key:
             continue
         if node.get("source_file"):
@@ -2351,11 +2363,15 @@ def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
                 # `PATH` env var (#1581). Fold only for genuinely case-insensitive
                 # languages, where `foo` legitimately resolves to `Foo`.
                 real_by_label.setdefault(key, []).append(node)
+                real_by_bare_label.setdefault(bare_key, []).append(node)
                 if _lang_is_case_insensitive(node.get("source_file")):
                     real_by_label_ci.setdefault(
                         _node_label_key(node, fold=True), []).append(node)
+                    real_by_bare_label_ci.setdefault(
+                        _node_label_key(node, fold=True, bare=True), []).append(node)
             elif _is_top_level_function_definition(node):
                 func_by_label.setdefault(key, []).append(node)
+                func_by_bare_label.setdefault(bare_key, []).append(node)
             continue
         stubs.append(node)
 
@@ -2387,17 +2403,25 @@ def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
         stub_id = str(stub.get("id", ""))
         if not stub_id:
             continue
-        candidates = real_by_label.get(_node_label_key(stub), [])
+        stub_key = _node_label_key(stub)
+        stub_bare_key = _node_label_key(stub, bare=True)
+        candidates = real_by_label.get(stub_key, [])
+        if len(candidates) != 1:
+            candidates = real_by_bare_label.get(stub_bare_key, [])
         if len(candidates) != 1:
             # No unique exact type match — fall back to a case-insensitive match, but
             # only against case-insensitive-language definitions (so a case-sensitive
             # `PATH` can never absorb a `Path` reference).
             candidates = real_by_label_ci.get(_node_label_key(stub, fold=True), [])
         if len(candidates) != 1:
+            candidates = real_by_bare_label_ci.get(_node_label_key(stub, fold=True, bare=True), [])
+        if len(candidates) != 1:
             # #1781: no unique type — try a unique top-level FUNCTION definition,
             # gated by (a) the stub not being used as a supertype and (b) a
             # language-family match with the stub's referrers.
-            fcands = func_by_label.get(_node_label_key(stub), [])
+            fcands = func_by_label.get(stub_key, [])
+            if len(fcands) != 1:
+                fcands = func_by_bare_label.get(stub_bare_key, [])
             if len(fcands) == 1 and stub_id not in supertype_stub_ids:
                 fams = stub_families.get(stub_id, set())
                 cand_fam = _lang_family(fcands[0].get("source_file"))
@@ -2592,9 +2616,6 @@ def _merge_csharp_partial_class_nodes(
     per_file: list[dict],
     all_nodes: list[dict],
     all_edges: list[dict],
-) -> None:
-    """Collapse C# `partial class Foo` halves split across files into ONE node
-    (#2332).
     paths: list[Path],
     root: Path,
 ) -> None:
@@ -6420,7 +6441,6 @@ def extract(
     # graph is identical regardless of scan root (#2072).
     _repoint_python_package_imports(paths, all_nodes, all_edges, root)
     _merge_swift_extensions(per_file, all_nodes, all_edges)
-    _merge_csharp_partial_class_nodes(per_file, all_nodes, all_edges)
     _merge_csharp_partial_class_nodes(per_file, all_nodes, all_edges, paths, root)
     _disambiguate_colliding_node_ids(all_nodes, all_edges, all_raw_calls, root)
     _canonicalize_csharp_namespace_nodes(all_nodes, all_edges)
@@ -6910,6 +6930,8 @@ def extract(
         all_edges.extend(_rl_edges[_e0:])
     else:
         run_language_resolvers(paths, per_file, all_nodes, all_edges)
+
+    _rewire_unique_stub_nodes(all_nodes, all_edges)
 
     # Relativize source_file fields so paths are portable across machines (#555).
     # When the node's id was itself minted from the absolute path, remap it to a

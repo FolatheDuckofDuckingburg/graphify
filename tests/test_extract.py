@@ -3979,6 +3979,72 @@ def test_rewire_builtin_supertype_guard_is_per_edge_not_per_stub():
     assert edges[1]["target"] == "app_exception_Exception"   # TS still resolves
 
 
+def test_rewire_binds_qualified_stub_to_real_definition():
+    """Verify stub rewiring binds qualified/bare stubs to unique located definitions."""
+    from graphify.extract import _rewire_unique_stub_nodes
+    nodes = [
+        {
+            "id": "config_settings_models_settings",
+            "label": "config.settings._models.Settings",
+            "file_type": "code",
+            "source_file": "config/settings/_models.py",
+            "source_location": "L38",
+        },
+        {
+            "id": "stub_settings_1",
+            "label": "Settings",
+            "file_type": "code",
+            "source_file": "",
+            "origin_file": "app/a.py",
+        },
+        {
+            "id": "stub_settings_2",
+            "label": "config.settings.Settings",
+            "file_type": "code",
+            "source_file": "",
+            "origin_file": "app/b.py",
+        },
+    ]
+    edges = [
+        {"source": "app_a_run", "target": "stub_settings_1", "relation": "uses", "source_file": "app/a.py"},
+        {"source": "app_b_run", "target": "stub_settings_2", "relation": "uses", "source_file": "app/b.py"},
+    ]
+    _rewire_unique_stub_nodes(nodes, edges)
+    assert edges[0]["target"] == "config_settings_models_settings"
+    assert edges[1]["target"] == "config_settings_models_settings"
+    remaining_ids = {n["id"] for n in nodes}
+    assert "stub_settings_1" not in remaining_ids
+    assert "stub_settings_2" not in remaining_ids
+
+
+def test_extract_rewires_cross_module_qualified_settings_stubs(tmp_path):
+    """End-to-end repro test: Settings defined at config/settings/_models.py and referenced
+    cross-module rewires all stubs to the single located definition."""
+    from graphify.extract import extract
+
+    root = tmp_path
+    f1 = root / "config" / "settings" / "_models.py"
+    f1.parent.mkdir(parents=True, exist_ok=True)
+    f1.write_text("class Settings:\n    pass\n")
+
+    f2 = root / "app" / "services" / "svc.py"
+    f2.parent.mkdir(parents=True, exist_ok=True)
+    f2.write_text("def run(s: Settings):\n    pass\n")
+
+    f3 = root / "app" / "controllers" / "ctrl.py"
+    f3.parent.mkdir(parents=True, exist_ok=True)
+    f3.write_text("def execute(cfg: Settings):\n    pass\n")
+
+    res = extract([f1, f2, f3], root=root)
+    node_ids = {n["id"] for n in res["nodes"]}
+    assert "config_settings_models_settings" in node_ids
+
+    # Confirm all parameter references in svc.py and ctrl.py target the single real definition
+    ref_targets = [e["target"] for e in res["edges"] if e.get("relation") == "references"]
+    assert len(ref_targets) == 2
+    assert all(t == "config_settings_models_settings" for t in ref_targets)
+
+
 def test_extract_emits_posix_source_file_for_relative_inputs(tmp_path):
     r"""source_file must be canonical POSIX on every node AND edge, whatever
     separator the caller's input paths used.
