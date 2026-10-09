@@ -797,14 +797,15 @@ def _disambiguate_colliding_node_ids(
             raw_call["caller_nid"] = unambiguous_remaps[str(raw_call["caller_nid"])]
 
 def _is_type_like_definition(node: dict) -> bool:
-    if node.get("type") == "namespace":
+    if node.get("type") in ("namespace", "file", "module"):
         return False
     label = str(node.get("label", "")).strip()
     if not label:
         return False
     if label.endswith(")") or label.startswith("."):
         return False
-    if "." in label:
+    from graphify.detect import CODE_EXTENSIONS
+    if any(label.lower().endswith(ext) for ext in CODE_EXTENSIONS):
         return False
     return node.get("file_type") == "code"
 

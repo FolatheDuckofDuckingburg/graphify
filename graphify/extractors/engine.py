@@ -1802,8 +1802,6 @@ def _csharp_method_receiver_types(
                     _csharp_receiver_type_name(
                         node.child_by_field_name("type"), source
                     ),
-                )
-        stack.extend(node.children)
                     scope,
                 )
         child_scope = (
