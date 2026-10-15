@@ -3405,13 +3405,22 @@ def _ts_receiver_type_table(
             stack.append(c)
     if field_table is not None:
         # Declared field/accessor/parameter-property types were inserted directly
-        # into field_table during the walk. Unique constructor assignments are the
-        # next tier; unique assignments in other methods are fallback evidence only.
-        for assignments in (constructor_assigned, method_assigned):
-            for cls, fields in assignments.items():
-                for name, types in fields.items():
-                    if len(types) == 1:
-                        field_table.setdefault(cls, {}).setdefault(name, next(iter(types)))
+        # into field_table during the walk. Constructor assignments are next, and
+        # method assignments are fallback evidence only. Any conflicting assignment
+        # at a higher tier blocks inference from a lower tier.
+        constructor_conflicts: set[tuple[str, str]] = set()
+        for cls, fields in constructor_assigned.items():
+            for name, types in fields.items():
+                if len(types) == 1:
+                    field_table.setdefault(cls, {}).setdefault(name, next(iter(types)))
+                elif len(types) > 1:
+                    constructor_conflicts.add((cls, name))
+        for cls, fields in method_assigned.items():
+            for name, types in fields.items():
+                if (cls, name) in constructor_conflicts:
+                    continue
+                if len(types) == 1:
+                    field_table.setdefault(cls, {}).setdefault(name, next(iter(types)))
 
 _TS_STATIC_SUFFIX = "\x00static"
 
