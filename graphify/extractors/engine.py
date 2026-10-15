@@ -3273,7 +3273,8 @@ def _ts_receiver_type_table(
         ctor = new_expr.child_by_field_name("constructor")
         return _read_text(ctor, source) if ctor is not None and ctor.type in ("identifier", "type_identifier") else None
 
-    assigned: dict[str, dict[str, str]] = {}
+    constructor_assigned: dict[str, dict[str, set[str]]] = {}
+    method_assigned: dict[str, dict[str, set[str]]] = {}
     stack = [root]
     while stack:
         n = stack.pop()
@@ -3327,29 +3328,33 @@ def _ts_receiver_type_table(
                         # either: keep the file table they read.
                         table[name] = tname
         elif t == "method_definition" and field_table is not None:
-            # The constructor declares fields too: parameter properties
-            # (`constructor(private repo: Repo)`) and `this.repo = repo` /
-            # `this.repo = new Repo()`. A declared field type wins over an
-            # assignment (merged after the walk).
             mname = n.child_by_field_name("name")
             owner_name = _class_name(n.parent)
-            accessor = next((c.type for c in n.children if c.type in ("get", "set")), None)
-            if mname is not None and owner_name is not None and accessor is not None:
-                # `get repo(): Repo` / `set repo(r: Repo)` read and write a
-                # `this.repo` of that type, like a field.
-                tname = None
-                if accessor == "get":
-                    ret = n.child_by_field_name("return_type")
-                    tname = (_bare_type_ident(ret) or _optional_type_ident(ret)) if ret is not None else None
-                else:
-                    params = n.child_by_field_name("parameters")
-                    first = next((p for p in params.named_children if p.type in ("required_parameter", "optional_parameter")), None) if params is not None else None
-                    ann = first.child_by_field_name("type") if first is not None else None
-                    tname = (_bare_type_ident(ann) or _optional_type_ident(ann)) if ann is not None else None
-                if tname:
-                    field_table.setdefault(owner_name, {}).setdefault(_read_text(mname, source), tname)
-            if (mname is not None and owner_name is not None
-                    and _read_text(mname, source) == "constructor"):
+            if mname is not None and owner_name is not None:
+                method_name = _read_text(mname, source)
+                is_constructor = method_name == "constructor"
+                is_static = any(c.type == "static" for c in n.children)
+                field_owner = owner_name + _TS_STATIC_SUFFIX if is_static else owner_name
+
+                accessor = next((c.type for c in n.children if c.type in ("get", "set")), None)
+                if accessor is not None:
+                    # `get repo(): Repo` / `set repo(r: Repo)` read and write a
+                    # `this.repo` of that type, like a field.
+                    tname = None
+                    if accessor == "get":
+                        ret = n.child_by_field_name("return_type")
+                        tname = (_bare_type_ident(ret) or _optional_type_ident(ret)) if ret is not None else None
+                    else:
+                        params = n.child_by_field_name("parameters")
+                        first = next((p for p in params.named_children if p.type in ("required_parameter", "optional_parameter")), None) if params is not None else None
+                        ann = first.child_by_field_name("type") if first is not None else None
+                        tname = (_bare_type_ident(ann) or _optional_type_ident(ann)) if ann is not None else None
+                    if tname:
+                        field_table.setdefault(field_owner, {}).setdefault(_read_text(mname, source), tname)
+
+                # Parameter properties are declarations and therefore outrank
+                # assignments. Typed parameters also let any method infer
+                # `this.field = parameter`, not just a constructor.
                 params = n.child_by_field_name("parameters")
                 typed: dict[str, str] = {}
                 for p in params.named_children if params is not None else ():
@@ -3363,29 +3368,50 @@ def _ts_receiver_type_table(
                         continue
                     pname = _read_text(pat, source)
                     typed[pname] = tname
-                    if any(c.type in ("accessibility_modifier", "readonly") for c in p.children):
+                    if is_constructor and any(c.type in ("accessibility_modifier", "readonly") for c in p.children):
                         field_table.setdefault(owner_name, {}).setdefault(pname, tname)
+
+                # Collect field assignments throughout the method, including nested
+                # blocks and arrows (which preserve `this`). A plain nested function
+                # has its own `this`, so stop at that boundary.
                 body = n.child_by_field_name("body")
-                for stmt in body.named_children if body is not None else ():
-                    expr = stmt.named_children[0] if stmt.type == "expression_statement" and stmt.named_children else None
-                    if expr is None or expr.type != "assignment_expression":
+                pending = [body] if body is not None else []
+                while pending:
+                    item = pending.pop()
+                    if item is not body and item.type in (
+                        "method_definition", "function_declaration", "function_expression",
+                        "generator_function_declaration", "generator_function",
+                    ):
                         continue
-                    left, right = expr.child_by_field_name("left"), expr.child_by_field_name("right")
-                    if left is None or right is None or left.type != "member_expression":
-                        continue
-                    obj, prop = left.child_by_field_name("object"), left.child_by_field_name("property")
-                    if obj is None or obj.type != "this" or prop is None:
-                        continue
-                    tname = (typed.get(_read_text(right, source)) if right.type == "identifier"
-                             else _new_type(right) if right.type == "new_expression" else None)
-                    if tname:
-                        assigned.setdefault(owner_name, {}).setdefault(_read_text(prop, source), tname)
+                    if item.type == "assignment_expression":
+                        left = item.child_by_field_name("left")
+                        right = item.child_by_field_name("right")
+                        if left is not None and right is not None and left.type == "member_expression":
+                            obj = left.child_by_field_name("object")
+                            prop = left.child_by_field_name("property")
+                            if obj is not None and obj.type == "this" and prop is not None:
+                                field_name = _read_text(prop, source)
+                                tname = (
+                                    typed.get(_read_text(right, source))
+                                    if right.type == "identifier"
+                                    else _new_type(right) if right.type == "new_expression"
+                                    else None
+                                )
+                                if field_name and tname:
+                                    assignments = constructor_assigned if is_constructor else method_assigned
+                                    assignments.setdefault(field_owner, {}).setdefault(field_name, set()).add(tname)
+                    pending.extend(item.children)
         for c in n.children:
             stack.append(c)
     if field_table is not None:
-        for cls, fields in assigned.items():
-            for name, tname in fields.items():
-                field_table.setdefault(cls, {}).setdefault(name, tname)
+        # Declared field/accessor/parameter-property types were inserted directly
+        # into field_table during the walk. Unique constructor assignments are the
+        # next tier; unique assignments in other methods are fallback evidence only.
+        for assignments in (constructor_assigned, method_assigned):
+            for cls, fields in assignments.items():
+                for name, types in fields.items():
+                    if len(types) == 1:
+                        field_table.setdefault(cls, {}).setdefault(name, next(iter(types)))
 
 _TS_STATIC_SUFFIX = "\x00static"
 
